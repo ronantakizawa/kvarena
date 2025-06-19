@@ -10,6 +10,7 @@ crate-type = ["cdylib", "rlib"]
 [dependencies]
 crossbeam = "0.8"
 log = "0.4"
+lazy_static = "1.4"
 
 [features]
 default = []

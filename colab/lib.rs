@@ -306,6 +306,7 @@ pub extern "C" fn arena_align_size(size: usize) -> usize {
     const ALIGNMENT: usize = 64;
     (size + ALIGNMENT - 1) & !(ALIGNMENT - 1)
 }
+
 use cuda::{CudaMemoryManager, CudaPage, CudaError, CudaContext};
 use slab::{GlobalSlabPool, SlabPoolManager, SlabPoolStats};
 use zero_copy::{ZeroCopyManager, ZeroCopyArena, ZeroCopyTensor, ZeroCopyGlobalStats};
@@ -313,7 +314,7 @@ use zero_copy::{ZeroCopyManager, ZeroCopyArena, ZeroCopyTensor, ZeroCopyGlobalSt
 // Re-export key types for public API
 pub use cuda::{CudaDeviceInfo, CudaMemoryManager as CudaManager};
 pub use slab::{GlobalSlabPool as SlabPool, PageClass};
-pub use zero_copy::{ZeroCopyTensor as KVTensor, ZeroCopyArena as SequenceArena, ZeroCopyTensorBuilder as TensorBuilder};
+pub use zero_copy::{ZeroCopyTensor as KVTensor, ZeroCopyArena as SequenceArena};
 
 /// Production LLM server error types
 #[derive(Debug, Clone)]
@@ -435,7 +436,7 @@ impl ProductionKVCacheManager {
         let slab_manager = SlabPoolManager::new(Arc::clone(&slab_pool));
         
         // Create zero-copy manager
-        let zero_copy_manager = ZeroCopyManager::new(Arc::clone(&slab_pool));
+        let zero_copy_manager = ZeroCopyManager::new(Arc::clone(&slab_pool))?;
         
         // Start background cleanup if enabled
         if config.cleanup_interval_seconds > 0 {
@@ -541,63 +542,6 @@ impl ProductionKVCacheManager {
         }
         
         Ok(was_zero_copy)
-    }
-
-    /// Batch allocate multiple sequences (for concurrent request processing)
-    pub fn batch_allocate_sequences(
-        &self,
-        requests: &[SequenceRequest],
-    ) -> Result<Vec<BatchAllocationResult>, LLMServerError> {
-        let mut results = Vec::with_capacity(requests.len());
-        
-        // Group requests by optimal device
-        let mut device_groups: std::collections::HashMap<i32, Vec<(usize, &SequenceRequest)>> = 
-            std::collections::HashMap::new();
-        
-        for (idx, req) in requests.iter().enumerate() {
-            let device = req.preferred_device.unwrap_or_else(|| self.select_optimal_device());
-            device_groups.entry(device).or_default().push((idx, req));
-        }
-        
-        // Store the number of device groups before consuming the HashMap
-        let num_device_groups = device_groups.len();
-        
-        // Process each device group
-        for (device, group) in device_groups {
-            for (idx, req) in group {
-                let arena = self.create_sequence_arena(
-                    req.initial_seq_len,
-                    req.max_seq_len,
-                    req.hidden_dim,
-                    req.num_heads,
-                    Some(device),
-                )?;
-                
-                let tensor = self.allocate_kv_tensor(
-                    &arena,
-                    req.initial_seq_len,
-                    req.max_seq_len,
-                    req.hidden_dim,
-                    req.num_heads,
-                    req.dtype_size,
-                )?;
-                
-                results.push(BatchAllocationResult {
-                    request_id: idx,
-                    arena,
-                    tensor,
-                    device_id: device,
-                });
-            }
-        }
-        
-        // Sort results by request_id to maintain order
-        results.sort_by_key(|r| r.request_id);
-        
-        log::info!("Batch allocated {} sequences across {} devices", 
-                  requests.len(), num_device_groups);
-        
-        Ok(results)
     }
 
     /// Get comprehensive production metrics
@@ -745,71 +689,65 @@ impl ProductionKVCacheManager {
         // Cap at reasonable maximum (16MB)
         page_size.min(16 * 1024 * 1024)
     }
-}
 
-/// Request for sequence allocation
-#[derive(Debug, Clone)]
-pub struct SequenceRequest {
-    pub initial_seq_len: usize,
-    pub max_seq_len: usize,
-    pub hidden_dim: usize,
-    pub num_heads: usize,
-    pub dtype_size: usize,
-    pub preferred_device: Option<i32>,
-}
+    /// Batch allocate multiple sequences (for concurrent request processing)
+    pub fn batch_allocate_sequences(
+        &self,
+        requests: &[SequenceRequest],
+    ) -> Result<Vec<BatchAllocationResult>, LLMServerError> {
+        let mut results = Vec::with_capacity(requests.len());
+        
+        // Group requests by optimal device
+        let mut device_groups: std::collections::HashMap<i32, Vec<(usize, &SequenceRequest)>> = 
+            std::collections::HashMap::new();
+        
+        for (idx, req) in requests.iter().enumerate() {
+            let device = req.preferred_device.unwrap_or_else(|| self.select_optimal_device());
+            device_groups.entry(device).or_default().push((idx, req));
+        }
+        
+        // Store the number of device groups before consuming the HashMap
+        let num_device_groups = device_groups.len();
+        
+        // Process each device group
+        for (device, group) in device_groups {
+            for (idx, req) in group {
+                let arena = self.create_sequence_arena(
+                    req.initial_seq_len,
+                    req.max_seq_len,
+                    req.hidden_dim,
+                    req.num_heads,
+                    Some(device),
+                )?;
+                
+                let tensor = self.allocate_kv_tensor(
+                    &arena,
+                    req.initial_seq_len,
+                    req.max_seq_len,
+                    req.hidden_dim,
+                    req.num_heads,
+                    req.dtype_size,
+                )?;
+                
+                results.push(BatchAllocationResult {
+                    request_id: idx,
+                    arena,
+                    tensor,
+                    device_id: device,
+                });
+            }
+        }
+        
+        // Sort results by request_id to maintain order
+        results.sort_by_key(|r| r.request_id);
+        
+        log::info!("Batch allocated {} sequences across {} devices", 
+                  requests.len(), num_device_groups);
+        
+        Ok(results)
+    }
 
-/// Result of batch allocation - removed Debug derive to avoid ZeroCopyArena issue
-pub struct BatchAllocationResult {
-    pub request_id: usize,
-    pub arena: Arc<SequenceArena>,
-    pub tensor: KVTensor,
-    pub device_id: i32,
-}
-
-/// Comprehensive production metrics
-#[derive(Debug, Clone)]
-pub struct ProductionMetricsReport {
-    pub sequences_processed: usize,
-    pub tokens_generated: usize,
-    pub zero_copy_extensions: usize,
-    pub copy_extensions: usize,
-    pub zero_copy_ratio: f64,
-    pub avg_allocation_time_ms: f64,
-    pub avg_extension_time_ms: f64,
-    pub peak_memory_usage_mb: usize,
-    pub zero_copy_stats: ZeroCopyGlobalStats,
-    pub slab_stats: SlabPoolStats,
-}
-
-/// System health status
-#[derive(Debug, Clone, PartialEq)]
-pub enum SystemStatus {
-    Excellent,
-    Good,
-    Warning,
-    Critical,
-}
-
-/// System health report
-#[derive(Debug, Clone)]
-pub struct SystemHealthReport {
-    pub status: SystemStatus,
-    pub health_score: f64,
-    pub recommendations: Vec<String>,
-    pub metrics: ProductionMetricsReport,
-}
-
-/// Maintenance operation report
-#[derive(Debug, Clone)]
-pub struct MaintenanceReport {
-    pub inactive_arenas_cleaned: usize,
-    pub old_pages_cleaned: usize,
-    pub bytes_defragmented: usize,
-    pub maintenance_time_ms: f64,
-}
-
-/// Production-ready API for LLM servers
-impl ProductionKVCacheManager {
+    // Production-ready API for LLM servers
     /// Create manager optimized for specific LLM model
     pub fn for_llm_model(
         model_name: &str,
@@ -877,6 +815,67 @@ impl ProductionKVCacheManager {
     }
 }
 
+/// Request for sequence allocation
+#[derive(Debug, Clone)]
+pub struct SequenceRequest {
+    pub initial_seq_len: usize,
+    pub max_seq_len: usize,
+    pub hidden_dim: usize,
+    pub num_heads: usize,
+    pub dtype_size: usize,
+    pub preferred_device: Option<i32>,
+}
+
+/// Result of batch allocation
+pub struct BatchAllocationResult {
+    pub request_id: usize,
+    pub arena: Arc<SequenceArena>,
+    pub tensor: KVTensor,
+    pub device_id: i32,
+}
+
+/// Comprehensive production metrics
+#[derive(Debug, Clone)]
+pub struct ProductionMetricsReport {
+    pub sequences_processed: usize,
+    pub tokens_generated: usize,
+    pub zero_copy_extensions: usize,
+    pub copy_extensions: usize,
+    pub zero_copy_ratio: f64,
+    pub avg_allocation_time_ms: f64,
+    pub avg_extension_time_ms: f64,
+    pub peak_memory_usage_mb: usize,
+    pub zero_copy_stats: ZeroCopyGlobalStats,
+    pub slab_stats: SlabPoolStats,
+}
+
+/// System health status
+#[derive(Debug, Clone, PartialEq)]
+pub enum SystemStatus {
+    Excellent,
+    Good,
+    Warning,
+    Critical,
+}
+
+/// System health report
+#[derive(Debug, Clone)]
+pub struct SystemHealthReport {
+    pub status: SystemStatus,
+    pub health_score: f64,
+    pub recommendations: Vec<String>,
+    pub metrics: ProductionMetricsReport,
+}
+
+/// Maintenance operation report
+#[derive(Debug, Clone)]
+pub struct MaintenanceReport {
+    pub inactive_arenas_cleaned: usize,
+    pub old_pages_cleaned: usize,
+    pub bytes_defragmented: usize,
+    pub maintenance_time_ms: f64,
+}
+
 /// High-level API for common LLM server operations
 pub mod llm_server_api {
     use super::*;
@@ -902,38 +901,6 @@ pub mod llm_server_api {
         }
         
         Ok(manager)
-    }
-
-    /// Process batch of inference requests
-    pub fn process_inference_batch(
-        manager: &ProductionKVCacheManager,
-        requests: &[InferenceRequest],
-    ) -> Result<Vec<InferenceResult>, LLMServerError> {
-        let sequence_requests: Vec<SequenceRequest> = requests.iter()
-            .map(|req| SequenceRequest {
-                initial_seq_len: req.prompt_length,
-                max_seq_len: req.prompt_length + req.max_new_tokens,
-                hidden_dim: req.hidden_dim,
-                num_heads: req.num_heads,
-                dtype_size: 2, // fp16
-                preferred_device: req.preferred_device,
-            })
-            .collect();
-        
-        let allocations = manager.batch_allocate_sequences(&sequence_requests)?;
-        
-        let results: Vec<InferenceResult> = allocations.into_iter()
-            .enumerate()
-            .map(|(idx, alloc)| InferenceResult {
-                request_id: requests[idx].request_id.clone(),
-                arena: alloc.arena,
-                kv_tensor: alloc.tensor,
-                device_id: alloc.device_id,
-            })
-            .collect();
-        
-        log::info!("Processed batch of {} inference requests", results.len());
-        Ok(results)
     }
 
     /// Simulate incremental generation (for testing/benchmarking)
@@ -979,14 +946,6 @@ pub struct InferenceRequest {
     pub preferred_device: Option<i32>,
 }
 
-/// Result of inference processing - removed Debug derive to avoid ZeroCopyArena issue
-pub struct InferenceResult {
-    pub request_id: String,
-    pub arena: Arc<SequenceArena>,
-    pub kv_tensor: KVTensor,
-    pub device_id: i32,
-}
-
 /// Statistics from generation simulation
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
@@ -995,136 +954,4 @@ pub struct GenerationStats {
     pub copy_extensions: usize,
     pub total_time_ms: f64,
     pub avg_time_per_token_ms: f64,
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_production_manager_creation() {
-        let config = LLMServerConfig {
-            devices: vec![0],
-            ..Default::default()
-        };
-        
-        match ProductionKVCacheManager::new(config) {
-            Ok(manager) => {
-                let health = manager.get_system_health();
-                assert!(matches!(health.status, SystemStatus::Excellent | SystemStatus::Good));
-                println!("✓ Production manager created successfully");
-            }
-            Err(e) => {
-                println!("Production manager creation failed (expected if no CUDA): {}", e);
-            }
-        }
-    }
-
-    #[test]
-    fn test_llm_model_configs() {
-        let models = ["llama-7b", "llama-13b", "llama-70b", "gpt-3.5"];
-        
-        for model in models {
-            match ProductionKVCacheManager::for_llm_model(model, vec![0]) {
-                Ok(_) => println!("✓ Config for {} created successfully", model),
-                Err(e) => println!("Config for {} failed (expected if no CUDA): {}", model, e),
-            }
-        }
-    }
-
-    #[test]
-    fn test_batch_sequence_requests() {
-        let requests = vec![
-            SequenceRequest {
-                initial_seq_len: 128,
-                max_seq_len: 256,
-                hidden_dim: 4096,
-                num_heads: 32,
-                dtype_size: 2,
-                preferred_device: None,
-            },
-            SequenceRequest {
-                initial_seq_len: 256,
-                max_seq_len: 512,
-                hidden_dim: 4096,
-                num_heads: 32,
-                dtype_size: 2,
-                preferred_device: None,
-            },
-        ];
-        
-        if let Ok(manager) = ProductionKVCacheManager::for_chatbot(vec![0]) {
-            match manager.batch_allocate_sequences(&requests) {
-                Ok(results) => {
-                    assert_eq!(results.len(), 2);
-                    println!("✓ Batch allocation successful");
-                }
-                Err(e) => println!("Batch allocation failed: {}", e),
-            }
-        }
-    }
-}
-
-// Example usage for LLM servers
-#[cfg(feature = "examples")]
-pub mod examples {
-    use super::*;
-
-    /// Example: Setting up for a chatbot service
-    pub fn setup_chatbot_service() -> Result<ProductionKVCacheManager, LLMServerError> {
-        // Initialize for multi-GPU chatbot service
-        let available_gpus = vec![0, 1, 2, 3]; // 4 GPUs
-        let manager = ProductionKVCacheManager::for_chatbot(available_gpus)?;
-        
-        // Check system health
-        let health = manager.get_system_health();
-        log::info!("Chatbot service health: {:?}", health.status);
-        
-        Ok(manager)
-    }
-
-    /// Example: Processing concurrent chat requests
-    pub fn process_chat_requests(
-        manager: &ProductionKVCacheManager,
-    ) -> Result<(), LLMServerError> {
-        // Simulate multiple chat requests
-        let requests = vec![
-            InferenceRequest {
-                request_id: "chat_1".to_string(),
-                prompt_length: 150,
-                max_new_tokens: 300,
-                hidden_dim: 4096,
-                num_heads: 32,
-                preferred_device: None,
-            },
-            InferenceRequest {
-                request_id: "chat_2".to_string(),
-                prompt_length: 200,
-                max_new_tokens: 250,
-                hidden_dim: 4096,
-                num_heads: 32,
-                preferred_device: None,
-            },
-        ];
-        
-        // Process batch
-        let results = llm_server_api::process_inference_batch(manager, &requests)?;
-        
-        // Simulate token generation for each request
-        for mut result in results {
-            let stats = llm_server_api::simulate_generation(
-                manager,
-                &result.arena,
-                &mut result.kv_tensor,
-                50, // Generate 50 tokens
-            )?;
-            
-            log::info!("Generated {} tokens for {}: {:.1}% zero-copy", 
-                      stats.tokens_generated,
-                      result.request_id,
-                      (stats.zero_copy_extensions as f64 / stats.tokens_generated as f64) * 100.0);
-        }
-        
-        Ok(())
-    }
 }

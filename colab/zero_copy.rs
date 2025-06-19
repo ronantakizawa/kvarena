@@ -1,15 +1,15 @@
-// src/zero_copy.rs - Eliminate copy amplification with true zero-copy extensions
+// src/zero_copy.rs - True zero-copy CUDA operations with device memory
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ptr::NonNull;
-use crate::cuda::{CudaPage, CudaError};
+use crate::cuda::{CudaPage, CudaError, CudaTensor, CudaContext};
 use crate::slab::{GlobalSlabPool, RecyclablePage};
 
-/// Zero-copy tensor descriptor that tracks memory layout without copying data
-#[derive(Debug, Clone)]
+/// Zero-copy tensor descriptor that operates directly on CUDA device memory
+#[derive(Debug)]
 pub struct ZeroCopyTensor {
-    /// Device pointer to the start of tensor data
-    device_ptr: NonNull<u8>,
+    /// CUDA device tensor
+    cuda_tensor: CudaTensor,
     /// Byte offset within the arena page
     offset: usize,
     /// Total allocated size in bytes
@@ -23,49 +23,15 @@ pub struct ZeroCopyTensor {
     /// Element size in bytes (e.g., 2 for fp16)
     element_size: usize,
     /// Reference to the underlying page for lifetime management
-    page_ref: Arc<PageReference>,
-}
-
-/// Reference to underlying page to prevent premature deallocation
-#[derive(Debug)]
-struct PageReference {
-    cuda_page: CudaPage,
+    page_ref: Arc<CudaPage>,
+    /// Arena ID for tracking
     arena_id: u64,
-    ref_count: AtomicUsize,
-}
-
-impl PageReference {
-    fn new(cuda_page: CudaPage, arena_id: u64) -> Self {
-        Self {
-            cuda_page,
-            arena_id,
-            ref_count: AtomicUsize::new(1),
-        }
-    }
-
-    fn clone_ref(&self) -> Arc<PageReference> {
-        self.ref_count.fetch_add(1, Ordering::Relaxed);
-        // This is safe because we're creating a new Arc to the same data
-        unsafe {
-            Arc::from_raw(self as *const PageReference)
-        }
-    }
-}
-
-impl Drop for PageReference {
-    fn drop(&mut self) {
-        let prev_count = self.ref_count.fetch_sub(1, Ordering::Relaxed);
-        if prev_count == 1 {
-            // Last reference, page can be recycled
-            log::debug!("Releasing page for arena {} to slab pool", self.arena_id);
-        }
-    }
 }
 
 impl ZeroCopyTensor {
-    /// Create new tensor descriptor from arena allocation
+    /// Create new tensor descriptor from CUDA arena allocation
     pub fn new(
-        cuda_page: &CudaPage,
+        cuda_page: &Arc<CudaPage>,
         offset: usize,
         allocated_size: usize,
         seq_len: usize,
@@ -77,25 +43,23 @@ impl ZeroCopyTensor {
         // Calculate actual used size
         let used_size = Self::calculate_tensor_size(seq_len, hidden_dim, num_heads, element_size);
         
-        if offset + used_size > cuda_page.size() {
+        if offset + allocated_size > cuda_page.size() {
             return Err(CudaError(-1)); // Out of bounds
         }
 
-        // Get device pointer at offset
-        let device_ptr = unsafe {
-            NonNull::new_unchecked(cuda_page.device_ptr_at_offset(offset) as *mut u8)
-        };
-
-        // Create page reference (this clones the CudaPage, but the underlying device memory is shared)
-        let page_ref = Arc::new(PageReference::new(
-            // We need to clone the CudaPage here, but this is just metadata
-            // The actual device memory is not copied
-            unsafe { std::ptr::read(cuda_page) }, // This is a hack - in real impl, we'd have a proper clone
-            arena_id,
-        ));
+        // Create CUDA tensor from page
+        let head_dim = hidden_dim / num_heads;
+        let kv_shape = vec![seq_len, num_heads, head_dim];
+        
+        let cuda_tensor = CudaTensor::from_page(
+            cuda_page,
+            offset,
+            kv_shape,
+            element_size,
+        )?;
 
         Ok(ZeroCopyTensor {
-            device_ptr,
+            cuda_tensor,
             offset,
             allocated_size,
             used_size,
@@ -103,22 +67,29 @@ impl ZeroCopyTensor {
             hidden_dim,
             num_heads,
             element_size,
-            page_ref,
+            page_ref: Arc::clone(cuda_page),
+            arena_id,
         })
     }
 
-    /// Extend tensor to new sequence length WITHOUT copying data
+    /// Extend tensor to new sequence length WITHOUT copying data (TRUE ZERO-COPY)
     pub fn extend_zero_copy(&mut self, new_seq_len: usize) -> Result<bool, CudaError> {
         let new_used_size = Self::calculate_tensor_size(new_seq_len, self.hidden_dim, self.num_heads, self.element_size);
         
-        // Check if we can extend in place
-        if self.offset + new_used_size <= self.page_ref.cuda_page.size() && 
-           new_used_size <= self.allocated_size {
-            // Zero-copy extension: just update metadata
+        // Check if we can extend in place within allocated space
+        if new_used_size <= self.allocated_size && 
+           self.offset + new_used_size <= self.page_ref.size() {
+            
+            // TRUE ZERO-COPY: Just update metadata, no memory operations
             self.seq_len = new_seq_len;
             self.used_size = new_used_size;
             
-            log::debug!("Zero-copy extension: {} -> {} tokens", 
+            // Update CUDA tensor shape (zero-copy reshape)
+            let head_dim = self.hidden_dim / self.num_heads;
+            let new_shape = vec![new_seq_len, self.num_heads, head_dim];
+            self.cuda_tensor.reshape(new_shape)?;
+            
+            log::debug!("TRUE zero-copy extension: {} -> {} tokens (no memory operations)", 
                        self.seq_len, new_seq_len);
             return Ok(true);
         }
@@ -127,31 +98,24 @@ impl ZeroCopyTensor {
         Ok(false)
     }
 
-    /// Create a view of this tensor for a specific sequence range
+    /// Create a zero-copy view of this tensor for a specific sequence range
     pub fn slice_view(&self, start_seq: usize, end_seq: usize) -> Result<ZeroCopyTensor, CudaError> {
         if start_seq >= self.seq_len || end_seq > self.seq_len || start_seq >= end_seq {
             return Err(CudaError(-1)); // Invalid slice
         }
 
+        // Create zero-copy slice of CUDA tensor
+        let slice_cuda_tensor = self.cuda_tensor.slice(start_seq, end_seq)?;
         let slice_seq_len = end_seq - start_seq;
+        
+        // Calculate new offset and size
         let head_dim = self.hidden_dim / self.num_heads;
-        
-        // Calculate offset for the slice (both key and value)
-        let tokens_per_tensor = self.seq_len * self.num_heads * head_dim;
-        let slice_offset_tokens = start_seq * self.num_heads * head_dim;
-        let slice_byte_offset = slice_offset_tokens * self.element_size;
-        
-        // Create new tensor pointing to the same memory but different offset
-        let slice_device_ptr = unsafe {
-            NonNull::new_unchecked(
-                (self.device_ptr.as_ptr() as *mut u8).add(slice_byte_offset)
-            )
-        };
-
+        let slice_offset_elements = start_seq * self.num_heads * head_dim;
+        let slice_byte_offset = slice_offset_elements * self.element_size;
         let slice_used_size = Self::calculate_tensor_size(slice_seq_len, self.hidden_dim, self.num_heads, self.element_size);
 
         Ok(ZeroCopyTensor {
-            device_ptr: slice_device_ptr,
+            cuda_tensor: slice_cuda_tensor,
             offset: self.offset + slice_byte_offset,
             allocated_size: self.allocated_size - slice_byte_offset,
             used_size: slice_used_size,
@@ -160,20 +124,21 @@ impl ZeroCopyTensor {
             num_heads: self.num_heads,
             element_size: self.element_size,
             page_ref: Arc::clone(&self.page_ref),
+            arena_id: self.arena_id,
         })
     }
 
-    /// Get device pointer for key tensor
-    pub fn key_ptr(&self) -> *mut u8 {
-        self.device_ptr.as_ptr()
+    /// Get CUDA device pointer for key tensor
+    pub fn key_device_ptr(&self) -> *mut std::ffi::c_void {
+        self.cuda_tensor.device_ptr()
     }
 
-    /// Get device pointer for value tensor  
-    pub fn value_ptr(&self) -> *mut u8 {
+    /// Get CUDA device pointer for value tensor  
+    pub fn value_device_ptr(&self) -> *mut std::ffi::c_void {
         let head_dim = self.hidden_dim / self.num_heads;
         let key_size = self.seq_len * self.num_heads * head_dim * self.element_size;
         unsafe {
-            self.device_ptr.as_ptr().add(key_size)
+            (self.cuda_tensor.device_ptr() as *mut u8).add(key_size) as *mut std::ffi::c_void
         }
     }
 
@@ -195,7 +160,7 @@ impl ZeroCopyTensor {
     /// Check if tensor can be extended to new length without reallocation
     pub fn can_extend_to(&self, new_seq_len: usize) -> bool {
         let new_size = Self::calculate_tensor_size(new_seq_len, self.hidden_dim, self.num_heads, self.element_size);
-        new_size <= self.allocated_size && self.offset + new_size <= self.page_ref.cuda_page.size()
+        new_size <= self.allocated_size && self.offset + new_size <= self.page_ref.size()
     }
 
     /// Get utilization ratio (used / allocated)
@@ -203,24 +168,27 @@ impl ZeroCopyTensor {
         self.used_size as f64 / self.allocated_size as f64
     }
 
-    /// Copy data from host to this tensor
+    /// Copy data from host to this CUDA tensor
     pub fn copy_from_host(&self, host_key_data: *const u8, host_value_data: *const u8) -> Result<(), CudaError> {
         let head_dim = self.hidden_dim / self.num_heads;
         let single_tensor_size = self.seq_len * self.num_heads * head_dim * self.element_size;
 
-        // Copy key data
-        self.page_ref.cuda_page.copy_from_host(
-            host_key_data as *const std::ffi::c_void,
-            single_tensor_size,
-            self.offset,
-        )?;
+        // Copy key data to device
+        self.cuda_tensor.copy_from_host(host_key_data as *const std::ffi::c_void)?;
 
-        // Copy value data
-        self.page_ref.cuda_page.copy_from_host(
-            host_value_data as *const std::ffi::c_void,
-            single_tensor_size,
-            self.offset + single_tensor_size,
-        )?;
+        // Copy value data to device (offset by key tensor size)
+        let value_tensor = self.value_device_ptr();
+        unsafe {
+            let result = crate::cuda::cudaMemcpy(
+                value_tensor,
+                host_value_data as *const std::ffi::c_void,
+                single_tensor_size,
+                1, // CUDA_MEMCPY_HOST_TO_DEVICE
+            );
+            if result != 0 {
+                return Err(CudaError(result));
+            }
+        }
 
         Ok(())
     }
@@ -242,22 +210,54 @@ impl ZeroCopyTensor {
         let copy_size = num_tokens * token_size;
         let token_offset = start_token * token_size;
 
-        // Copy new key tokens
-        self.page_ref.cuda_page.copy_from_host(
-            unsafe { host_key_data.add(token_offset) } as *const std::ffi::c_void,
-            copy_size,
-            self.offset + token_offset,
-        )?;
+        // Copy new key tokens to device
+        let key_dst = unsafe {
+            (self.key_device_ptr() as *mut u8).add(token_offset) as *mut std::ffi::c_void
+        };
+        let key_src = unsafe {
+            host_key_data.add(token_offset) as *const std::ffi::c_void
+        };
 
-        // Copy new value tokens
-        let single_tensor_size = self.seq_len * token_size / num_tokens; // Recalculate for safety
-        self.page_ref.cuda_page.copy_from_host(
-            unsafe { host_value_data.add(token_offset) } as *const std::ffi::c_void,
-            copy_size,
-            self.offset + single_tensor_size + token_offset,
-        )?;
+        unsafe {
+            let result = crate::cuda::cudaMemcpy(key_dst, key_src, copy_size, 1);
+            if result != 0 {
+                return Err(CudaError(result));
+            }
+        }
 
+        // Copy new value tokens to device
+        let value_dst = unsafe {
+            (self.value_device_ptr() as *mut u8).add(token_offset) as *mut std::ffi::c_void
+        };
+        let value_src = unsafe {
+            host_value_data.add(token_offset) as *const std::ffi::c_void
+        };
+
+        unsafe {
+            let result = crate::cuda::cudaMemcpy(value_dst, value_src, copy_size, 1);
+            if result != 0 {
+                return Err(CudaError(result));
+            }
+        }
+
+        log::debug!("Copied {} new tokens to CUDA device starting at token {}", 
+                   num_tokens, start_token);
         Ok(())
+    }
+
+    /// Synchronize all CUDA operations on this tensor
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        self.cuda_tensor.synchronize()
+    }
+
+    /// Get the underlying CUDA tensor
+    pub fn cuda_tensor(&self) -> &CudaTensor {
+        &self.cuda_tensor
+    }
+
+    /// Get device ID
+    pub fn device_id(&self) -> i32 {
+        self.cuda_tensor.device_id()
     }
 
     fn calculate_tensor_size(seq_len: usize, hidden_dim: usize, num_heads: usize, element_size: usize) -> usize {
@@ -266,21 +266,54 @@ impl ZeroCopyTensor {
     }
 }
 
-/// Zero-copy arena that manages tensor allocations without data copying
+// Implement Clone for ZeroCopyTensor
+impl Clone for ZeroCopyTensor {
+    fn clone(&self) -> Self {
+        // Create a new CUDA tensor view of the same memory
+        let cuda_tensor = CudaTensor::from_page(
+            &self.page_ref,
+            self.offset,
+            self.cuda_tensor.shape().to_vec(),
+            self.element_size,
+        ).expect("Cloning should always succeed for valid tensors");
+
+        ZeroCopyTensor {
+            cuda_tensor,
+            offset: self.offset,
+            allocated_size: self.allocated_size,
+            used_size: self.used_size,
+            seq_len: self.seq_len,
+            hidden_dim: self.hidden_dim,
+            num_heads: self.num_heads,
+            element_size: self.element_size,
+            page_ref: Arc::clone(&self.page_ref),
+            arena_id: self.arena_id,
+        }
+    }
+}
+
+/// Zero-copy arena that manages CUDA tensor allocations without data copying
 #[derive(Debug)]
 pub struct ZeroCopyArena {
     arena_id: u64,
-    cuda_page: CudaPage,
+    cuda_page: Arc<CudaPage>,
     current_offset: AtomicUsize,
     allocated_tensors: std::sync::Mutex<Vec<ZeroCopyTensor>>,
     slab_pool: Arc<GlobalSlabPool>,
     device_id: i32,
+    cuda_context: Option<Arc<CudaContext>>,
 }
 
 impl ZeroCopyArena {
     /// Create new zero-copy arena with CUDA page
-    pub fn new(cuda_page: CudaPage, arena_id: u64, slab_pool: Arc<GlobalSlabPool>) -> Self {
+    pub fn new(
+        cuda_page: CudaPage, 
+        arena_id: u64, 
+        slab_pool: Arc<GlobalSlabPool>,
+        cuda_context: Option<Arc<CudaContext>>,
+    ) -> Self {
         let device_id = cuda_page.device_id();
+        let cuda_page = Arc::new(cuda_page);
         
         Self {
             arena_id,
@@ -289,10 +322,11 @@ impl ZeroCopyArena {
             allocated_tensors: std::sync::Mutex::new(Vec::new()),
             slab_pool,
             device_id,
+            cuda_context,
         }
     }
 
-    /// Allocate tensor with extra space for future growth
+    /// Allocate tensor with extra space for future growth (CUDA device memory)
     pub fn allocate_tensor_with_growth(
         &self,
         initial_seq_len: usize,
@@ -305,14 +339,14 @@ impl ZeroCopyArena {
         let allocated_size = ZeroCopyTensor::calculate_tensor_size(max_seq_len, hidden_dim, num_heads, element_size);
         let aligned_size = Self::align_size(allocated_size);
 
-        // Bump allocate within the page
+        // Bump allocate within the CUDA page
         let offset = self.current_offset.fetch_add(aligned_size, Ordering::Relaxed);
         
         if offset + aligned_size > self.cuda_page.size() {
             return Err(CudaError(-2)); // Out of space
         }
 
-        // Create zero-copy tensor
+        // Create zero-copy tensor that operates directly on CUDA memory
         let tensor = ZeroCopyTensor::new(
             &self.cuda_page,
             offset,
@@ -329,20 +363,157 @@ impl ZeroCopyArena {
             tensors.push(tensor.clone());
         }
 
-        log::debug!("Allocated zero-copy tensor: {}x{}x{} at offset {}", 
+        log::debug!("Allocated zero-copy CUDA tensor: {}x{}x{} at device offset {}", 
                    initial_seq_len, num_heads, hidden_dim / num_heads, offset);
 
         Ok(tensor)
     }
 
-    /// Try to extend existing tensor without reallocation
+    /// Try to extend existing tensor without reallocation (TRUE ZERO-COPY)
     pub fn try_extend_tensor(
         &self,
         tensor: &mut ZeroCopyTensor,
         new_seq_len: usize,
     ) -> Result<bool, CudaError> {
-        // This is the key optimization: no data copying!
+        // This is the key optimization: no data copying on CUDA device!
         tensor.extend_zero_copy(new_seq_len)
+    }
+
+    /// Zero-copy defragmentation using CUDA device-to-device operations
+    pub fn defragment(&self) -> Result<usize, CudaError> {
+        let mut tensors = self.allocated_tensors.lock().unwrap();
+        if tensors.is_empty() {
+            return Ok(0);
+        }
+
+        // Sort tensors by offset for optimal compaction
+        tensors.sort_by_key(|t| t.offset);
+
+        let mut compacted_offset = 0;
+        let mut bytes_saved = 0;
+
+        for tensor in tensors.iter_mut() {
+            if tensor.offset > compacted_offset {
+                // Use CUDA device-to-device copy for zero-copy move
+                let move_size = tensor.used_size;
+                self.cuda_page.copy_device_to_device(
+                    tensor.offset,
+                    compacted_offset,
+                    move_size,
+                )?;
+
+                bytes_saved += tensor.offset - compacted_offset;
+                
+                // Update tensor metadata (no device memory changes needed)
+                tensor.offset = compacted_offset;
+                
+                // Create new CUDA tensor view at new location
+                let head_dim = tensor.hidden_dim / tensor.num_heads;
+                let shape = vec![tensor.seq_len, tensor.num_heads, head_dim];
+                tensor.cuda_tensor = CudaTensor::from_page(
+                    &self.cuda_page,
+                    compacted_offset,
+                    shape,
+                    tensor.element_size,
+                )?;
+            }
+
+            compacted_offset += Self::align_size(tensor.used_size);
+        }
+
+        // Update current offset
+        self.current_offset.store(compacted_offset, Ordering::Relaxed);
+
+        // Synchronize all device operations
+        self.cuda_page.synchronize()?;
+
+        log::info!("Defragmented CUDA arena {}: saved {} bytes using device-to-device copies", 
+                  self.arena_id, bytes_saved);
+        Ok(bytes_saved)
+    }
+
+    /// Bulk zero-copy tensor creation for batch processing
+    pub fn allocate_batch_tensors(
+        &self,
+        requests: &[(usize, usize, usize, usize, usize)], // (seq_len, max_seq_len, hidden_dim, num_heads, element_size)
+    ) -> Result<Vec<ZeroCopyTensor>, CudaError> {
+        let mut tensors = Vec::with_capacity(requests.len());
+        
+        for &(initial_seq_len, max_seq_len, hidden_dim, num_heads, element_size) in requests {
+            let tensor = self.allocate_tensor_with_growth(
+                initial_seq_len,
+                max_seq_len,
+                hidden_dim,
+                num_heads,
+                element_size,
+            )?;
+            tensors.push(tensor);
+        }
+
+        log::debug!("Bulk allocated {} CUDA tensors in arena {}", 
+                   tensors.len(), self.arena_id);
+        Ok(tensors)
+    }
+
+    /// Zero-copy tensor concatenation (combines multiple tensors into one view)
+    pub fn concatenate_tensors(
+        &self,
+        tensors: &[&ZeroCopyTensor],
+        axis: usize,
+    ) -> Result<ZeroCopyTensor, CudaError> {
+        if tensors.is_empty() {
+            return Err(CudaError(-1));
+        }
+
+        // Verify all tensors are compatible and contiguous
+        let first = &tensors[0];
+        let mut total_seq_len = first.seq_len;
+        let mut current_offset = first.offset;
+        
+        for tensor in &tensors[1..] {
+            if tensor.hidden_dim != first.hidden_dim ||
+               tensor.num_heads != first.num_heads ||
+               tensor.element_size != first.element_size {
+                return Err(CudaError(-1)); // Incompatible tensors
+            }
+            
+            // Check if tensors are contiguous
+            let expected_offset = current_offset + first.used_size;
+            if tensor.offset != expected_offset {
+                return Err(CudaError(-1)); // Not contiguous
+            }
+            
+            total_seq_len += tensor.seq_len;
+            current_offset = tensor.offset;
+        }
+
+        // Create concatenated tensor view (zero-copy)
+        let total_size = ZeroCopyTensor::calculate_tensor_size(
+            total_seq_len, first.hidden_dim, first.num_heads, first.element_size
+        );
+
+        let head_dim = first.hidden_dim / first.num_heads;
+        let concat_shape = vec![total_seq_len, first.num_heads, head_dim];
+        
+        let cuda_tensor = CudaTensor::from_page(
+            &self.cuda_page,
+            first.offset,
+            concat_shape,
+            first.element_size,
+        )?;
+
+        Ok(ZeroCopyTensor {
+            cuda_tensor,
+            offset: first.offset,
+            allocated_size: total_size,
+            used_size: total_size,
+            seq_len: total_seq_len,
+            hidden_dim: first.hidden_dim,
+            num_heads: first.num_heads,
+            element_size: first.element_size,
+            page_ref: Arc::clone(&self.cuda_page),
+            arena_id: self.arena_id,
+        })
     }
 
     /// Get arena utilization
@@ -357,7 +528,7 @@ impl ZeroCopyArena {
         self.cuda_page.size().saturating_sub(used)
     }
 
-    /// Get arena statistics
+    /// Get CUDA-specific arena statistics
     pub fn stats(&self) -> ZeroCopyArenaStats {
         let tensors = self.allocated_tensors.lock().unwrap();
         let total_tensors = tensors.len();
@@ -379,72 +550,55 @@ impl ZeroCopyArena {
             total_allocated_bytes,
             avg_tensor_utilization: avg_utilization,
             arena_utilization: self.utilization(),
+            cuda_memory_pressure: self.get_cuda_memory_pressure(),
         }
     }
 
-    /// Defragment arena by compacting tensors (advanced operation)
-    pub fn defragment(&self) -> Result<usize, CudaError> {
-        let mut tensors = self.allocated_tensors.lock().unwrap();
-        if tensors.is_empty() {
-            return Ok(0);
-        }
-
-        // Sort tensors by offset for optimal compaction
-        tensors.sort_by_key(|t| t.offset);
-
-        let mut compacted_offset = 0;
-        let mut bytes_saved = 0;
-
-        for tensor in tensors.iter_mut() {
-            if tensor.offset > compacted_offset {
-                // Move tensor data to compacted position
-                let move_size = tensor.used_size;
-                self.cuda_page.copy_device_to_device(
-                    tensor.offset,
-                    compacted_offset,
-                    move_size,
-                )?;
-
-                bytes_saved += tensor.offset - compacted_offset;
-                
-                // Update tensor metadata
-                tensor.offset = compacted_offset;
-                tensor.device_ptr = unsafe {
-                    std::ptr::NonNull::new_unchecked(
-                        self.cuda_page.device_ptr_at_offset(compacted_offset) as *mut u8
-                    )
-                };
+    /// Get CUDA device memory pressure
+    fn get_cuda_memory_pressure(&self) -> f64 {
+        if let Some(context) = &self.cuda_context {
+            if let Some(stats) = context.device_stats_detailed(self.device_id) {
+                return stats.utilization / 100.0;
             }
-
-            compacted_offset += Self::align_size(tensor.used_size);
         }
+        0.0
+    }
 
-        // Update current offset
-        self.current_offset.store(compacted_offset, Ordering::Relaxed);
+    /// Synchronize all CUDA operations in this arena
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        self.cuda_page.synchronize()
+    }
 
-        log::info!("Defragmented arena {}: saved {} bytes", self.arena_id, bytes_saved);
-        Ok(bytes_saved)
+    /// Get the underlying CUDA page
+    pub fn cuda_page(&self) -> &Arc<CudaPage> {
+        &self.cuda_page
+    }
+
+    /// Check if all operations in this arena are complete
+    pub fn is_ready(&self) -> Result<bool, CudaError> {
+        self.cuda_page.is_ready()
     }
 
     fn align_size(size: usize) -> usize {
-        const ALIGNMENT: usize = 64; // CUDA memory alignment
+        const ALIGNMENT: usize = 256; // CUDA memory alignment for optimal performance
         (size + ALIGNMENT - 1) & !(ALIGNMENT - 1)
     }
 }
 
 impl Drop for ZeroCopyArena {
     fn drop(&mut self) {
-        // Return page to slab pool for recycling
-        log::debug!("Returning arena {} page to slab pool", self.arena_id);
+        // Synchronize before cleanup
+        let _ = self.cuda_page.synchronize();
         
-        // Note: We need to take ownership of cuda_page here
-        // This is a simplified version - in practice we'd need more careful lifetime management
-        let cuda_page = unsafe { std::ptr::read(&self.cuda_page) };
-        self.slab_pool.return_page(cuda_page);
+        // Return page to slab pool for recycling
+        log::debug!("Returning CUDA arena {} page to slab pool", self.arena_id);
+        
+        // The Arc<CudaPage> will be properly cleaned up when all references are dropped
+        // The slab pool will handle CUDA memory recycling
     }
 }
 
-/// Statistics for zero-copy arena performance monitoring
+/// Enhanced statistics for CUDA zero-copy arena
 #[derive(Debug, Clone)]
 pub struct ZeroCopyArenaStats {
     pub arena_id: u64,
@@ -456,44 +610,51 @@ pub struct ZeroCopyArenaStats {
     pub total_allocated_bytes: usize,
     pub avg_tensor_utilization: f64,
     pub arena_utilization: f64,
+    pub cuda_memory_pressure: f64,
 }
 
-/// Zero-copy manager that coordinates multiple arenas
+/// CUDA-enabled zero-copy manager
 pub struct ZeroCopyManager {
     slab_pool: Arc<GlobalSlabPool>,
+    cuda_context: Arc<CudaContext>,
     next_arena_id: AtomicUsize,
     active_arenas: std::sync::Mutex<std::collections::HashMap<u64, Arc<ZeroCopyArena>>>,
-    device_managers: std::sync::RwLock<std::collections::HashMap<i32, crate::cuda::CudaMemoryManager>>,
 }
 
 impl ZeroCopyManager {
-    /// Create new zero-copy manager
-    pub fn new(slab_pool: Arc<GlobalSlabPool>) -> Self {
-        Self {
+    /// Create new zero-copy manager with CUDA context
+    pub fn new(slab_pool: Arc<GlobalSlabPool>) -> Result<Self, CudaError> {
+        let cuda_context = Arc::new(CudaContext::new()?);
+        
+        Ok(Self {
             slab_pool,
+            cuda_context,
             next_arena_id: AtomicUsize::new(0),
             active_arenas: std::sync::Mutex::new(std::collections::HashMap::new()),
-            device_managers: std::sync::RwLock::new(std::collections::HashMap::new()),
-        }
+        })
     }
 
-    /// Create new arena on specified device
+    /// Create new CUDA arena on specified device
     pub fn create_arena(&self, device_id: i32, page_size: usize) -> Result<Arc<ZeroCopyArena>, CudaError> {
         // Try to get page from slab pool first
         let cuda_page = if let Some(recycled_page) = self.slab_pool.get_page(page_size, device_id) {
-            log::debug!("Reused page from slab pool for device {}", device_id);
+            log::debug!("Reused CUDA page from slab pool for device {}", device_id);
             recycled_page
         } else {
-            // Allocate new page
-            let manager = self.get_or_create_device_manager(device_id)?;
-            let new_page = manager.allocate_page_on_device(page_size, device_id)?;
+            // Allocate new CUDA page
+            let new_page = self.cuda_context.allocate_page_on_device(page_size, device_id)?;
             self.slab_pool.record_page_creation(page_size);
-            log::debug!("Allocated new page for device {}", device_id);
+            log::debug!("Allocated new CUDA page for device {}", device_id);
             new_page
         };
 
         let arena_id = self.next_arena_id.fetch_add(1, Ordering::Relaxed) as u64;
-        let arena = Arc::new(ZeroCopyArena::new(cuda_page, arena_id, Arc::clone(&self.slab_pool)));
+        let arena = Arc::new(ZeroCopyArena::new(
+            cuda_page, 
+            arena_id, 
+            Arc::clone(&self.slab_pool),
+            Some(Arc::clone(&self.cuda_context)),
+        ));
 
         // Track active arena
         if let Ok(mut arenas) = self.active_arenas.lock() {
@@ -503,21 +664,29 @@ impl ZeroCopyManager {
         Ok(arena)
     }
 
-    /// Create arena with automatic device selection
+    /// Create arena with automatic device selection based on memory availability
     pub fn create_arena_auto(&self, page_size: usize) -> Result<Arc<ZeroCopyArena>, CudaError> {
-        // Find device with most available memory
-        let device_managers = self.device_managers.read().unwrap();
-        let best_device = device_managers
-            .values()
-            .min_by_key(|manager| (manager.memory_pressure() * 1000.0) as u32)
-            .map(|manager| manager.current_device_info().device_id)
-            .unwrap_or(0);
+        let arena = self.cuda_context.allocate_page_auto(page_size)
+            .and_then(|page| {
+                let device_id = page.device_id();
+                let arena_id = self.next_arena_id.fetch_add(1, Ordering::Relaxed) as u64;
+                Ok(Arc::new(ZeroCopyArena::new(
+                    page,
+                    arena_id,
+                    Arc::clone(&self.slab_pool),
+                    Some(Arc::clone(&self.cuda_context)),
+                )))
+            })?;
 
-        drop(device_managers);
-        self.create_arena(best_device, page_size)
+        // Track arena
+        if let Ok(mut arenas) = self.active_arenas.lock() {
+            arenas.insert(arena.arena_id, Arc::clone(&arena));
+        }
+
+        Ok(arena)
     }
 
-    /// Get comprehensive statistics across all arenas
+    /// Get comprehensive CUDA statistics across all arenas
     pub fn global_stats(&self) -> ZeroCopyGlobalStats {
         let arenas = self.active_arenas.lock().unwrap();
         let arena_stats: Vec<ZeroCopyArenaStats> = arenas
@@ -536,7 +705,16 @@ impl ZeroCopyManager {
             0.0
         };
 
+        let avg_cuda_pressure = if total_arenas > 0 {
+            arena_stats.iter().map(|s| s.cuda_memory_pressure).sum::<f64>() / total_arenas as f64
+        } else {
+            0.0
+        };
+
         let slab_stats = self.slab_pool.stats();
+
+        // Get CUDA context statistics
+        let cuda_stats = self.get_cuda_context_stats();
 
         ZeroCopyGlobalStats {
             total_arenas,
@@ -544,9 +722,20 @@ impl ZeroCopyManager {
             total_used_bytes,
             total_allocated_bytes,
             avg_arena_utilization: avg_utilization,
+            avg_cuda_memory_pressure: avg_cuda_pressure,
             slab_pool_stats: slab_stats,
             arena_stats,
+            cuda_context_stats: cuda_stats,
         }
+    }
+
+    /// Get CUDA context statistics
+    fn get_cuda_context_stats(&self) -> Vec<crate::cuda::CudaDeviceStats> {
+        let manager = self.cuda_context.manager();
+        manager.device_infos
+            .iter()
+            .filter_map(|info| self.cuda_context.device_stats_detailed(info.device_id))
+            .collect()
     }
 
     /// Cleanup inactive arenas
@@ -559,12 +748,12 @@ impl ZeroCopyManager {
 
         let removed = initial_count - arenas.len();
         if removed > 0 {
-            log::info!("Cleaned up {} inactive arenas", removed);
+            log::info!("Cleaned up {} inactive CUDA arenas", removed);
         }
         removed
     }
 
-    /// Force defragmentation of all active arenas
+    /// Force defragmentation of all active arenas using CUDA device operations
     pub fn defragment_all(&self) -> Result<usize, CudaError> {
         let arenas = self.active_arenas.lock().unwrap();
         let mut total_saved = 0;
@@ -572,14 +761,25 @@ impl ZeroCopyManager {
         for arena in arenas.values() {
             match arena.defragment() {
                 Ok(saved) => total_saved += saved,
-                Err(e) => log::warn!("Failed to defragment arena {}: {}", arena.arena_id, e),
+                Err(e) => log::warn!("Failed to defragment CUDA arena {}: {}", arena.arena_id, e),
             }
         }
 
         Ok(total_saved)
     }
 
-    /// Get performance recommendations
+    /// Synchronize all CUDA operations across all arenas
+    pub fn synchronize_all(&self) -> Result<(), CudaError> {
+        let arenas = self.active_arenas.lock().unwrap();
+        
+        for arena in arenas.values() {
+            arena.synchronize()?;
+        }
+
+        Ok(())
+    }
+
+    /// Get performance recommendations based on CUDA metrics
     pub fn get_recommendations(&self) -> Vec<String> {
         let stats = self.global_stats();
         let mut recommendations = Vec::new();
@@ -589,6 +789,14 @@ impl ZeroCopyManager {
             recommendations.push(format!(
                 "Low average arena utilization ({:.1}%). Consider smaller page sizes or arena pooling.",
                 stats.avg_arena_utilization * 100.0
+            ));
+        }
+
+        // Check CUDA memory pressure
+        if stats.avg_cuda_memory_pressure > 0.8 {
+            recommendations.push(format!(
+                "High CUDA memory pressure ({:.1}%). Consider reducing batch sizes or using smaller models.",
+                stats.avg_cuda_memory_pressure * 100.0
             ));
         }
 
@@ -614,41 +822,26 @@ impl ZeroCopyManager {
             ));
         }
 
-        // Check for fragmentation
-        let fragmented_arenas = stats.arena_stats.iter()
-            .filter(|s| s.arena_utilization > 0.9 && s.avg_tensor_utilization < 0.6)
-            .count();
-
-        if fragmented_arenas > 0 {
-            recommendations.push(format!(
-                "{} arenas show signs of fragmentation. Consider running defragmentation.",
-                fragmented_arenas
-            ));
+        // CUDA-specific recommendations
+        for device_stats in &stats.cuda_context_stats {
+            if device_stats.utilization > 90.0 {
+                recommendations.push(format!(
+                    "Device {} memory utilization very high ({:.1}%). Consider using multiple devices.",
+                    device_stats.device_id, device_stats.utilization
+                ));
+            }
         }
 
         recommendations
     }
 
-    fn get_or_create_device_manager(&self, device_id: i32) -> Result<crate::cuda::CudaMemoryManager, CudaError> {
-        // Try to get existing manager
-        {
-            let managers = self.device_managers.read().unwrap();
-            if let Some(manager) = managers.get(&device_id) {
-                // We need to clone the manager here, but CudaMemoryManager doesn't implement Clone
-                // In a real implementation, we'd store Arc<CudaMemoryManager> or redesign this
-                return crate::cuda::CudaMemoryManager::new();
-            }
-        }
-
-        // Create new manager
-        let mut managers = self.device_managers.write().unwrap();
-        let manager = crate::cuda::CudaMemoryManager::new()?;
-        // managers.insert(device_id, manager.clone()); // Would need Clone implementation
-        Ok(manager)
+    /// Get CUDA context reference
+    pub fn cuda_context(&self) -> &Arc<CudaContext> {
+        &self.cuda_context
     }
 }
 
-/// Global statistics for zero-copy system
+/// Enhanced global statistics with CUDA information
 #[derive(Debug, Clone)]
 pub struct ZeroCopyGlobalStats {
     pub total_arenas: usize,
@@ -656,17 +849,21 @@ pub struct ZeroCopyGlobalStats {
     pub total_used_bytes: usize,
     pub total_allocated_bytes: usize,
     pub avg_arena_utilization: f64,
+    pub avg_cuda_memory_pressure: f64,
     pub slab_pool_stats: crate::slab::SlabPoolStats,
     pub arena_stats: Vec<ZeroCopyArenaStats>,
+    pub cuda_context_stats: Vec<crate::cuda::CudaDeviceStats>,
 }
 
 impl ZeroCopyGlobalStats {
-    /// Calculate overall system efficiency
+    /// Calculate overall system efficiency including CUDA factors
     pub fn system_efficiency(&self) -> f64 {
         if self.total_allocated_bytes == 0 {
             1.0
         } else {
-            self.total_used_bytes as f64 / self.total_allocated_bytes as f64
+            let memory_efficiency = self.total_used_bytes as f64 / self.total_allocated_bytes as f64;
+            let cuda_efficiency = 1.0 - self.avg_cuda_memory_pressure;
+            (memory_efficiency + cuda_efficiency) / 2.0
         }
     }
 
@@ -674,158 +871,95 @@ impl ZeroCopyGlobalStats {
     pub fn needs_optimization(&self) -> bool {
         self.avg_arena_utilization < 0.5 || 
         self.system_efficiency() < 0.7 ||
-        self.slab_pool_stats.recycling_efficiency < 0.5
+        self.slab_pool_stats.recycling_efficiency < 0.5 ||
+        self.avg_cuda_memory_pressure > 0.8
     }
 
-    /// Get memory pressure indicator (0.0 = low, 1.0 = high)
+    /// Get memory pressure indicator including CUDA pressure
     pub fn memory_pressure(&self) -> f64 {
-        // Simple heuristic based on utilization and efficiency
         let util_pressure = self.avg_arena_utilization;
         let efficiency_pressure = 1.0 - self.system_efficiency();
-        (util_pressure + efficiency_pressure) / 2.0
-    }
-}
-
-/// Builder for zero-copy tensors with automatic optimization
-pub struct ZeroCopyTensorBuilder {
-    arena: Arc<ZeroCopyArena>,
-    seq_len: usize,
-    hidden_dim: usize,
-    num_heads: usize,
-    element_size: usize,
-    growth_factor: f64,
-    max_seq_len: Option<usize>,
-}
-
-impl ZeroCopyTensorBuilder {
-    pub fn new(arena: Arc<ZeroCopyArena>) -> Self {
-        Self {
-            arena,
-            seq_len: 512,
-            hidden_dim: 4096,
-            num_heads: 32,
-            element_size: 2,
-            growth_factor: 1.5,
-            max_seq_len: None,
-        }
-    }
-
-    pub fn seq_len(mut self, seq_len: usize) -> Self {
-        self.seq_len = seq_len;
-        self
-    }
-
-    pub fn hidden_dim(mut self, hidden_dim: usize) -> Self {
-        self.hidden_dim = hidden_dim;
-        self
-    }
-
-    pub fn num_heads(mut self, num_heads: usize) -> Self {
-        self.num_heads = num_heads;
-        self
-    }
-
-    pub fn element_size(mut self, element_size: usize) -> Self {
-        self.element_size = element_size;
-        self
-    }
-
-    pub fn growth_factor(mut self, factor: f64) -> Self {
-        self.growth_factor = factor;
-        self
-    }
-
-    pub fn max_seq_len(mut self, max_len: usize) -> Self {
-        self.max_seq_len = Some(max_len);
-        self
-    }
-
-    pub fn build(self) -> Result<ZeroCopyTensor, CudaError> {
-        let max_seq_len = self.max_seq_len.unwrap_or_else(|| {
-            (self.seq_len as f64 * self.growth_factor) as usize
-        });
-
-        self.arena.allocate_tensor_with_growth(
-            self.seq_len,
-            max_seq_len,
-            self.hidden_dim,
-            self.num_heads,
-            self.element_size,
-        )
+        let cuda_pressure = self.avg_cuda_memory_pressure;
+        (util_pressure + efficiency_pressure + cuda_pressure) / 3.0
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cuda::CudaMemoryManager;
-    use crate::slab::GlobalSlabPool;
 
     #[test]
-    fn test_zero_copy_tensor_extension() {
-        // This test requires CUDA, mock if not available
-        if let Ok(manager) = CudaMemoryManager::new() {
-            if let Ok(cuda_page) = manager.allocate_page(1024 * 1024) {
-                let mut tensor = ZeroCopyTensor::new(
-                    &cuda_page,
-                    0,
-                    1024 * 1024,
-                    512,
-                    4096,
-                    32,
-                    2,
-                    1,
-                ).unwrap();
-
-                // Test zero-copy extension
-                let extended = tensor.extend_zero_copy(1024).unwrap();
-                assert!(extended, "Should be able to extend in place");
-                assert_eq!(tensor.seq_len, 1024);
-                
-                println!("✓ Zero-copy extension test passed");
-            }
-        }
-    }
-
-    #[test]
-    fn test_zero_copy_arena() {
-        if let Ok(manager) = CudaMemoryManager::new() {
-            if let Ok(cuda_page) = manager.allocate_page(4 * 1024 * 1024) {
-                let slab_pool = Arc::new(GlobalSlabPool::new());
-                let arena = ZeroCopyArena::new(cuda_page, 1, slab_pool);
-
-                // Test tensor allocation
+    fn test_zero_copy_cuda_tensor_creation() {
+        if let Ok(manager) = ZeroCopyManager::new(Arc::new(GlobalSlabPool::new())) {
+            if let Ok(arena) = manager.create_arena_auto(4 * 1024 * 1024) { // 4MB
                 let tensor = arena.allocate_tensor_with_growth(
-                    256, 512, 2048, 16, 2
+                    128, 256, 2048, 16, 2 // seq_len, max_seq_len, hidden_dim, num_heads, element_size
                 ).unwrap();
-
-                assert_eq!(tensor.seq_len, 256);
-                assert!(tensor.can_extend_to(512));
-                
-                println!("✓ Zero-copy arena test passed");
-            }
-        }
-    }
-
-    #[test]
-    fn test_tensor_builder() {
-        if let Ok(manager) = CudaMemoryManager::new() {
-            if let Ok(cuda_page) = manager.allocate_page(4 * 1024 * 1024) {
-                let slab_pool = Arc::new(GlobalSlabPool::new());
-                let arena = Arc::new(ZeroCopyArena::new(cuda_page, 1, slab_pool));
-
-                let tensor = ZeroCopyTensorBuilder::new(arena)
-                    .seq_len(128)
-                    .hidden_dim(2048)
-                    .num_heads(16)
-                    .growth_factor(2.0)
-                    .build()
-                    .unwrap();
 
                 assert_eq!(tensor.seq_len, 128);
-                assert!(tensor.can_extend_to(256)); // 2x growth factor
+                assert!(tensor.can_extend_to(256));
+                assert_eq!(tensor.device_id(), arena.device_id);
                 
-                println!("✓ Tensor builder test passed");
+                println!("✓ Zero-copy CUDA tensor creation test passed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_true_zero_copy_extension() {
+        if let Ok(manager) = ZeroCopyManager::new(Arc::new(GlobalSlabPool::new())) {
+            if let Ok(arena) = manager.create_arena_auto(4 * 1024 * 1024) {
+                let mut tensor = arena.allocate_tensor_with_growth(
+                    64, 256, 1024, 8, 2
+                ).unwrap();
+
+                // Test true zero-copy extension
+                let extended = arena.try_extend_tensor(&mut tensor, 128).unwrap();
+                assert!(extended, "Should be able to extend in place");
+                assert_eq!(tensor.seq_len, 128);
+                
+                println!("✓ True zero-copy extension test passed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cuda_device_operations() {
+        if let Ok(manager) = ZeroCopyManager::new(Arc::new(GlobalSlabPool::new())) {
+            if let Ok(arena) = manager.create_arena_auto(4 * 1024 * 1024) {
+                let tensor1 = arena.allocate_tensor_with_growth(64, 128, 512, 8, 2).unwrap();
+                let tensor2 = arena.allocate_tensor_with_growth(64, 128, 512, 8, 2).unwrap();
+
+                // Test synchronization
+                arena.synchronize().expect("Synchronization should work");
+                
+                // Test defragmentation
+                let saved = arena.defragment().unwrap();
+                println!("✓ CUDA defragmentation saved {} bytes", saved);
+                
+                println!("✓ CUDA device operations test passed");
+            }
+        }
+    }
+
+    #[test]
+    fn test_batch_allocation() {
+        if let Ok(manager) = ZeroCopyManager::new(Arc::new(GlobalSlabPool::new())) {
+            if let Ok(arena) = manager.create_arena_auto(8 * 1024 * 1024) { // 8MB
+                let requests = vec![
+                    (32, 64, 256, 4, 2),
+                    (64, 128, 256, 4, 2),
+                    (128, 256, 256, 4, 2),
+                ];
+
+                let tensors = arena.allocate_batch_tensors(&requests).unwrap();
+                assert_eq!(tensors.len(), 3);
+                
+                for (i, tensor) in tensors.iter().enumerate() {
+                    assert_eq!(tensor.seq_len, requests[i].0);
+                }
+                
+                println!("✓ Batch allocation test passed");
             }
         }
     }

@@ -9,8 +9,8 @@ use crate::{
 
 // Opaque pointers for C FFI
 pub struct CProductionManager(ProductionKVCacheManager);
-pub struct CSequenceArena(Arc<crate::SequenceArena>);
-pub struct CKVTensor(crate::KVTensor);
+pub struct CSequenceArena(Arc<crate::ZeroCopyArena>);
+pub struct CKVTensor(crate::ZeroCopyTensor);
 
 // Error codes for production API
 pub const PROD_SUCCESS: i32 = 0;
@@ -289,8 +289,8 @@ pub extern "C" fn prod_get_tensor_device_ptrs(
     let (seq_len, num_heads, head_dim) = tensor_ref.dimensions();
 
     unsafe {
-        *key_ptr_out = tensor_ref.key_ptr() as *mut c_void;
-        *value_ptr_out = tensor_ref.value_ptr() as *mut c_void;
+        *key_ptr_out = tensor_ref.key_device_ptr() as *mut c_void;
+        *value_ptr_out = tensor_ref.value_device_ptr() as *mut c_void;
         *seq_len_out = seq_len;
         *num_heads_out = num_heads;
         *head_dim_out = head_dim;
