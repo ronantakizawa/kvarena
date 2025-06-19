@@ -1,0 +1,28 @@
+[package]
+name = "arena_kv_cache"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+name = "arena_kv_cache"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crossbeam = "0.8"
+
+[dependencies.pyo3]
+version = "0.20"
+features = ["extension-module", "abi3-py38"]
+optional = true
+
+[features]
+default = []
+python = ["pyo3"]
+
+# Ensure symbols are exported
+[profile.release]
+lto = false
+panic = "abort"
+
+[profile.dev]
+panic = "abort"
