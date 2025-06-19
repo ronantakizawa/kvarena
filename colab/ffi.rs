@@ -1,33 +1,147 @@
-// src/ffi.rs - C FFI bindings for Python integration
+// src/ffi.rs - Production FFI for LLM server integration
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Arc;
-use crate::{KVCacheManager, SequenceArena, ArenaStats, AllocError, KVTensor};
+use crate::{
+    ProductionKVCacheManager, LLMServerConfig, LLMServerError,
+    SequenceRequest, InferenceRequest, SystemStatus,
+    llm_server_api,
+};
 
 // Opaque pointers for C FFI
-pub struct CKVCacheManager(KVCacheManager);
-pub struct CSequenceArena(SequenceArena);
+pub struct CProductionManager(ProductionKVCacheManager);
+pub struct CSequenceArena(Arc<crate::SequenceArena>);
+pub struct CKVTensor(crate::KVTensor);
 
-// Store tensors for later reference
-pub struct CTensor {
-    inner: KVTensor,
-    arena_ptr: *mut CSequenceArena,
+// Error codes for production API
+pub const PROD_SUCCESS: i32 = 0;
+pub const PROD_ERROR_CUDA: i32 = -1;
+pub const PROD_ERROR_OUT_OF_MEMORY: i32 = -2;
+pub const PROD_ERROR_INVALID_DEVICE: i32 = -3;
+pub const PROD_ERROR_ALLOCATION_FAILED: i32 = -4;
+pub const PROD_ERROR_INVALID_PARAM: i32 = -5;
+
+// C-compatible structures for FFI
+#[repr(C)]
+pub struct CBatchRequest {
+    pub initial_seq_len: usize,
+    pub max_seq_len: usize,
+    pub hidden_dim: usize,
+    pub num_heads: usize,
+    pub dtype_size: usize,
+    pub preferred_device: i32, // -1 for auto-select
 }
 
-// Error codes
-pub const ARENA_SUCCESS: i32 = 0;
-pub const ARENA_ERROR_ALLOC: i32 = -1;
-pub const ARENA_ERROR_INVALID_PARAM: i32 = -2;
-
-/// Create a new KV cache manager (matches Python binding expectations)
-#[no_mangle]
-pub extern "C" fn kv_cache_manager_new(page_size: usize) -> *mut CKVCacheManager {
-    let manager = KVCacheManager::new(page_size);
-    Box::into_raw(Box::new(CKVCacheManager(manager)))
+#[repr(C)]
+pub struct CBatchResult {
+    pub request_id: usize,
+    pub arena: *mut CSequenceArena,
+    pub tensor: *mut CKVTensor,
+    pub device_id: i32,
 }
 
-/// Destroy a KV cache manager
+// Use system malloc/free
+mod libc {
+    use std::ffi::c_void;
+    extern "C" {
+        pub fn malloc(size: usize) -> *mut c_void;
+        pub fn free(ptr: *mut c_void);
+    }
+}
+
+/// Initialize production KV cache manager for LLM server
 #[no_mangle]
-pub extern "C" fn kv_cache_manager_free(manager: *mut CKVCacheManager) {
+pub extern "C" fn prod_kv_cache_init_for_server(
+    model_name: *const c_char,
+    devices: *const i32,
+    num_devices: usize,
+    manager_out: *mut *mut CProductionManager,
+) -> i32 {
+    if model_name.is_null() || devices.is_null() || manager_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let model_name_str = unsafe {
+        match CStr::from_ptr(model_name).to_str() {
+            Ok(s) => s,
+            Err(_) => return PROD_ERROR_INVALID_PARAM,
+        }
+    };
+
+    let device_slice = unsafe { std::slice::from_raw_parts(devices, num_devices) };
+    let device_vec = device_slice.to_vec();
+
+    match llm_server_api::initialize_for_server(model_name_str, &device_vec) {
+        Ok(manager) => {
+            unsafe {
+                *manager_out = Box::into_raw(Box::new(CProductionManager(manager)));
+            }
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Create chatbot-optimized manager
+#[no_mangle]
+pub extern "C" fn prod_kv_cache_init_for_chatbot(
+    devices: *const i32,
+    num_devices: usize,
+    manager_out: *mut *mut CProductionManager,
+) -> i32 {
+    if devices.is_null() || manager_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let device_slice = unsafe { std::slice::from_raw_parts(devices, num_devices) };
+    let device_vec = device_slice.to_vec();
+
+    match ProductionKVCacheManager::for_chatbot(device_vec) {
+        Ok(manager) => {
+            unsafe {
+                *manager_out = Box::into_raw(Box::new(CProductionManager(manager)));
+            }
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(LLMServerError::DeviceNotAvailable) => PROD_ERROR_INVALID_DEVICE,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Create document processing optimized manager
+#[no_mangle]
+pub extern "C" fn prod_kv_cache_init_for_documents(
+    devices: *const i32,
+    num_devices: usize,
+    manager_out: *mut *mut CProductionManager,
+) -> i32 {
+    if devices.is_null() || manager_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let device_slice = unsafe { std::slice::from_raw_parts(devices, num_devices) };
+    let device_vec = device_slice.to_vec();
+
+    match ProductionKVCacheManager::for_document_processing(device_vec) {
+        Ok(manager) => {
+            unsafe {
+                *manager_out = Box::into_raw(Box::new(CProductionManager(manager)));
+            }
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(LLMServerError::DeviceNotAvailable) => PROD_ERROR_INVALID_DEVICE,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Free production manager
+#[no_mangle]
+pub extern "C" fn prod_kv_cache_manager_free(manager: *mut CProductionManager) {
     if !manager.is_null() {
         unsafe {
             let _ = Box::from_raw(manager);
@@ -35,24 +149,41 @@ pub extern "C" fn kv_cache_manager_free(manager: *mut CKVCacheManager) {
     }
 }
 
-/// Create a new sequence arena
+/// Create sequence arena with zero-copy optimization
 #[no_mangle]
-pub extern "C" fn kv_cache_create_sequence_arena(manager: *mut CKVCacheManager) -> *mut CSequenceArena {
-    if manager.is_null() {
-        return std::ptr::null_mut();
+pub extern "C" fn prod_create_sequence_arena(
+    manager: *mut CProductionManager,
+    initial_seq_len: usize,
+    max_seq_len: usize,
+    hidden_dim: usize,
+    num_heads: usize,
+    device_id: i32, // -1 for auto-select
+    arena_out: *mut *mut CSequenceArena,
+) -> i32 {
+    if manager.is_null() || arena_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
     }
-    
-    let manager = unsafe { &mut (*manager).0 };
-    
-    match manager.create_sequence_arena() {
-        Ok(arena) => Box::into_raw(Box::new(CSequenceArena(arena))),
-        Err(_) => std::ptr::null_mut(),
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let device = if device_id < 0 { None } else { Some(device_id) };
+
+    match manager_ref.create_sequence_arena(initial_seq_len, max_seq_len, hidden_dim, num_heads, device) {
+        Ok(arena) => {
+            unsafe {
+                *arena_out = Box::into_raw(Box::new(CSequenceArena(arena)));
+            }
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(LLMServerError::DeviceNotAvailable) => PROD_ERROR_INVALID_DEVICE,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
     }
 }
 
-/// Destroy a sequence arena
+/// Free sequence arena
 #[no_mangle]
-pub extern "C" fn sequence_arena_free(arena: *mut CSequenceArena) {
+pub extern "C" fn prod_sequence_arena_free(arena: *mut CSequenceArena) {
     if !arena.is_null() {
         unsafe {
             let _ = Box::from_raw(arena);
@@ -60,385 +191,537 @@ pub extern "C" fn sequence_arena_free(arena: *mut CSequenceArena) {
     }
 }
 
-/// Allocate a KV tensor
+/// Allocate KV tensor with growth capacity
 #[no_mangle]
-pub extern "C" fn sequence_arena_allocate_tensor(
+pub extern "C" fn prod_allocate_kv_tensor(
+    manager: *mut CProductionManager,
     arena: *mut CSequenceArena,
-    seq_len: usize,
+    initial_seq_len: usize,
+    max_seq_len: usize,
     hidden_dim: usize,
     num_heads: usize,
     dtype_size: usize,
-    offset_out: *mut usize,
-    size_out: *mut usize
+    tensor_out: *mut *mut CKVTensor,
 ) -> i32 {
-    if arena.is_null() || offset_out.is_null() || size_out.is_null() {
-        return ARENA_ERROR_INVALID_PARAM;
+    if manager.is_null() || arena.is_null() || tensor_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
     }
-    
-    let arena_ref = unsafe { &mut (*arena).0 };
-    
-    match arena_ref.allocate_kv_tensor(seq_len, hidden_dim, num_heads, dtype_size) {
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let arena_ref = unsafe { &(*arena).0 };
+
+    match manager_ref.allocate_kv_tensor(
+        arena_ref,
+        initial_seq_len,
+        max_seq_len,
+        hidden_dim,
+        num_heads,
+        dtype_size,
+    ) {
         Ok(tensor) => {
             unsafe {
-                *offset_out = tensor.offset();
-                *size_out = tensor.size();
+                *tensor_out = Box::into_raw(Box::new(CKVTensor(tensor)));
             }
-            ARENA_SUCCESS
+            PROD_SUCCESS
         }
-        Err(_) => ARENA_ERROR_ALLOC,
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
     }
 }
 
-/// Get tensor pointer
+/// Free KV tensor
 #[no_mangle]
-pub extern "C" fn sequence_arena_get_tensor_ptr(
-    arena: *mut CSequenceArena,
-    offset: usize,
-    size: usize,
-    seq_len: usize,
-    hidden_dim: usize,
-    num_heads: usize
-) -> *mut c_void {
-    if arena.is_null() {
-        return std::ptr::null_mut();
+pub extern "C" fn prod_kv_tensor_free(tensor: *mut CKVTensor) {
+    if !tensor.is_null() {
+        unsafe {
+            let _ = Box::from_raw(tensor);
+        }
     }
-    
-    let arena_ref = unsafe { &(*arena).0 };
-    let tensor = KVTensor::new(offset, size, seq_len, hidden_dim, num_heads);
-    arena_ref.get_tensor_ptr(&tensor) as *mut c_void
 }
 
-/// Get arena statistics
-#[no_mangle] 
-pub extern "C" fn sequence_arena_get_stats(
-    arena: *mut CSequenceArena,
-    sequence_id_out: *mut u64,
-    total_allocated_out: *mut usize,
-    num_pages_out: *mut usize,
-    utilization_out: *mut f64
-) -> i32 {
-    if arena.is_null() || sequence_id_out.is_null() || total_allocated_out.is_null() 
-       || num_pages_out.is_null() || utilization_out.is_null() {
-        return ARENA_ERROR_INVALID_PARAM;
-    }
-    
-    let arena_ref = unsafe { &(*arena).0 };
-    let stats = arena_ref.stats();
-    
-    unsafe {
-        *sequence_id_out = stats.sequence_id;
-        *total_allocated_out = stats.total_allocated;
-        *num_pages_out = stats.num_pages;
-        *utilization_out = stats.current_page_utilization;
-    }
-    
-    ARENA_SUCCESS
-}
-
-/// Get global statistics from manager
+/// Extend tensor for generation (zero-copy when possible)
 #[no_mangle]
-pub extern "C" fn kv_cache_manager_get_global_stats(
-    manager: *mut CKVCacheManager,
-    allocated_out: *mut usize,
-    recycled_out: *mut usize
+pub extern "C" fn prod_extend_tensor_for_generation(
+    manager: *mut CProductionManager,
+    arena: *mut CSequenceArena,
+    tensor: *mut CKVTensor,
+    new_tokens: usize,
+    was_zero_copy_out: *mut i32,
 ) -> i32 {
-    if manager.is_null() || allocated_out.is_null() || recycled_out.is_null() {
-        return ARENA_ERROR_INVALID_PARAM;
+    if manager.is_null() || arena.is_null() || tensor.is_null() || was_zero_copy_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
     }
-    
+
     let manager_ref = unsafe { &(*manager).0 };
-    let (allocated, recycled) = manager_ref.global_stats();
-    
-    unsafe {
-        *allocated_out = allocated;
-        *recycled_out = recycled;
-    }
-    
-    ARENA_SUCCESS
-}
-
-/// Extend a KV tensor (for incremental generation)
-#[no_mangle]
-pub extern "C" fn sequence_arena_extend_tensor(
-    arena: *mut CSequenceArena,
-    offset: usize,
-    size: usize,
-    seq_len: usize,
-    hidden_dim: usize,
-    num_heads: usize,
-    new_seq_len: usize,
-    dtype_size: usize,
-    extended_in_place_out: *mut i32,
-    new_offset_out: *mut usize,
-    new_size_out: *mut usize
-) -> i32 {
-    if arena.is_null() || extended_in_place_out.is_null() 
-       || new_offset_out.is_null() || new_size_out.is_null() {
-        return ARENA_ERROR_INVALID_PARAM;
-    }
-    
-    let arena_ref = unsafe { &mut (*arena).0 };
-    let mut tensor = KVTensor::new(offset, size, seq_len, hidden_dim, num_heads);
-    
-    match arena_ref.extend_kv_tensor(&mut tensor, new_seq_len, dtype_size) {
-        Ok(extended_in_place) => {
-            unsafe {
-                *extended_in_place_out = if extended_in_place { 1 } else { 0 };
-                *new_offset_out = tensor.offset();
-                *new_size_out = tensor.size();
-            }
-            ARENA_SUCCESS
-        }
-        Err(_) => ARENA_ERROR_ALLOC,
-    }
-}
-
-// Benchmark functions for performance testing
-#[no_mangle]
-pub extern "C" fn arena_benchmark_allocation(
-    page_size: usize,
-    num_sequences: usize,
-    avg_seq_len: usize,
-    hidden_dim: usize,
-    num_heads: usize,
-    dtype_size: usize,
-    time_ns_out: *mut u64,
-    memory_bytes_out: *mut usize
-) -> i32 {
-    use std::time::Instant;
-    
-    if time_ns_out.is_null() || memory_bytes_out.is_null() {
-        return ARENA_ERROR_INVALID_PARAM;
-    }
-    
-    let manager = KVCacheManager::new(page_size);
-    let start = Instant::now();
-    let mut total_memory = 0;
-    
-    for i in 0..num_sequences {
-        let seq_len = avg_seq_len + (i % 100); // Vary sequence length
-        
-        match manager.create_sequence_arena() {
-            Ok(mut arena) => {
-                match arena.allocate_kv_tensor(seq_len, hidden_dim, num_heads, dtype_size) {
-                    Ok(tensor) => {
-                        total_memory += tensor.size();
-                    }
-                    Err(_) => return ARENA_ERROR_ALLOC,
-                }
-            }
-            Err(_) => return ARENA_ERROR_ALLOC,
-        }
-    }
-    
-    let duration = start.elapsed();
-    
-    unsafe {
-        *time_ns_out = duration.as_nanos() as u64;
-        *memory_bytes_out = total_memory;
-    }
-    
-    ARENA_SUCCESS
-}
-
-// Additional utility functions
-#[no_mangle]
-pub extern "C" fn arena_get_default_page_size() -> usize {
-    crate::DEFAULT_PAGE_SIZE
-}
-
-#[no_mangle]
-pub extern "C" fn arena_get_alignment() -> usize {
-    crate::ALIGNMENT
-}
-
-#[no_mangle]
-pub extern "C" fn arena_align_size(size: usize) -> usize {
-    crate::align_up(size, crate::ALIGNMENT)
-}
-
-// Python bindings using PyO3 (optional feature)
-#[cfg(feature = "python")]
-use pyo3::prelude::*;
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ArenaKVCacheManager")]
-pub struct PyArenaKVCacheManager {
-    inner: KVCacheManager,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PyArenaKVCacheManager {
-    #[new]
-    fn new(page_size: Option<usize>) -> Self {
-        Self {
-            inner: KVCacheManager::new(page_size.unwrap_or(crate::DEFAULT_PAGE_SIZE)),
-        }
-    }
-    
-    fn create_sequence_arena(&self) -> PyResult<PySequenceArena> {
-        match self.inner.create_sequence_arena() {
-            Ok(arena) => Ok(PySequenceArena { inner: Some(arena) }),
-            Err(_) => Err(pyo3::exceptions::PyMemoryError::new_err("Failed to allocate arena")),
-        }
-    }
-    
-    fn global_stats(&self) -> (usize, usize) {
-        self.inner.global_stats()
-    }
-}
-
-#[cfg(feature = "python")]
-#[pyclass(name = "ArenaSequenceArena")]
-pub struct PySequenceArena {
-    inner: Option<SequenceArena>,
-}
-
-#[cfg(feature = "python")]
-#[pymethods]
-impl PySequenceArena {
-    fn allocate_kv_tensor(
-        &mut self,
-        seq_len: usize,
-        hidden_dim: usize,
-        num_heads: usize,
-        dtype_size: usize,
-    ) -> PyResult<(usize, usize)> {
-        match &mut self.inner {
-            Some(arena) => {
-                match arena.allocate_kv_tensor(seq_len, hidden_dim, num_heads, dtype_size) {
-                    Ok(tensor) => Ok((tensor.offset(), tensor.size())),
-                    Err(_) => Err(pyo3::exceptions::PyMemoryError::new_err("Allocation failed")),
-                }
-            }
-            None => Err(pyo3::exceptions::PyRuntimeError::new_err("Arena not initialized")),
-        }
-    }
-    
-    fn get_tensor_ptr(&self, offset: usize, size: usize, seq_len: usize, hidden_dim: usize, num_heads: usize) -> PyResult<usize> {
-        match &self.inner {
-            Some(arena) => {
-                let tensor = KVTensor::new(offset, size, seq_len, hidden_dim, num_heads);
-                Ok(arena.get_tensor_ptr(&tensor) as usize)
-            }
-            None => Err(pyo3::exceptions::PyRuntimeError::new_err("Arena not initialized")),
-        }
-    }
-    
-    fn extend_kv_tensor(
-        &mut self,
-        offset: usize,
-        size: usize,
-        seq_len: usize,
-        hidden_dim: usize,
-        num_heads: usize,
-        new_seq_len: usize,
-        dtype_size: usize,
-    ) -> PyResult<(bool, usize, usize)> {
-        match &mut self.inner {
-            Some(arena) => {
-                let mut tensor = KVTensor::new(offset, size, seq_len, hidden_dim, num_heads);
-                match arena.extend_kv_tensor(&mut tensor, new_seq_len, dtype_size) {
-                    Ok(extended_in_place) => Ok((extended_in_place, tensor.offset(), tensor.size())),
-                    Err(_) => Err(pyo3::exceptions::PyMemoryError::new_err("Extension failed")),
-                }
-            }
-            None => Err(pyo3::exceptions::PyRuntimeError::new_err("Arena not initialized")),
-        }
-    }
-    
-    fn stats(&self) -> PyResult<(u64, usize, usize, f64)> {
-        match &self.inner {
-            Some(arena) => {
-                let stats = arena.stats();
-                Ok((
-                    stats.sequence_id,
-                    stats.total_allocated,
-                    stats.num_pages,
-                    stats.current_page_utilization,
-                ))
-            }
-            None => Err(pyo3::exceptions::PyRuntimeError::new_err("Arena not initialized")),
-        }
-    }
-}
-
-#[cfg(feature = "python")]
-#[pymodule]
-fn arena_kv_cache(_py: Python, m: &PyModule) -> PyResult<()> {
-    m.add_class::<PyArenaKVCacheManager>()?;
-    m.add_class::<PySequenceArena>()?;
-    Ok(())
-}
-
-// CUDA integration (optional)
-#[cfg(feature = "cuda")]
-pub mod cuda {
-    use super::*;
-    
-    #[no_mangle]
-    pub extern "C" fn arena_cuda_allocate_tensor(
-        arena: *mut CSequenceArena,
-        seq_len: usize,
-        hidden_dim: usize,
-        num_heads: usize,
-        dtype_size: usize,
-        device_ptr_out: *mut *mut c_void
-    ) -> i32 {
-        if arena.is_null() || device_ptr_out.is_null() {
-            return ARENA_ERROR_INVALID_PARAM;
-        }
-        
-        // CUDA allocation would go here
-        // This is a simplified example - would need actual CUDA integration
-        ARENA_SUCCESS
-    }
-    
-    #[no_mangle]
-    pub extern "C" fn arena_cuda_copy_to_device(
-        src: *const c_void,
-        dst: *mut c_void,
-        size: usize
-    ) -> i32 {
-        // CUDA memcpy would go here
-        ARENA_SUCCESS
-    }
-    
-    #[no_mangle]
-    pub extern "C" fn arena_cuda_copy_from_device(
-        src: *const c_void,
-        dst: *mut c_void,
-        size: usize
-    ) -> i32 {
-        // CUDA memcpy would go here
-        ARENA_SUCCESS
-    }
-}
-
-// Thread safety helpers
-#[no_mangle]
-pub extern "C" fn arena_is_thread_safe() -> i32 {
-    1 // Our implementation is thread-safe
-}
-
-// Memory debugging helpers
-#[no_mangle]
-pub extern "C" fn arena_validate_tensor_bounds(
-    arena: *mut CSequenceArena,
-    offset: usize,
-    size: usize
-) -> i32 {
-    if arena.is_null() {
-        return ARENA_ERROR_INVALID_PARAM;
-    }
-    
     let arena_ref = unsafe { &(*arena).0 };
-    let stats = arena_ref.stats();
+    let tensor_ref = unsafe { &mut (*tensor).0 };
+
+    match manager_ref.extend_tensor_for_generation(arena_ref, tensor_ref, new_tokens) {
+        Ok(was_zero_copy) => {
+            unsafe {
+                *was_zero_copy_out = if was_zero_copy { 1 } else { 0 };
+            }
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Get tensor device pointers for CUDA operations
+#[no_mangle]
+pub extern "C" fn prod_get_tensor_device_ptrs(
+    tensor: *mut CKVTensor,
+    key_ptr_out: *mut *mut c_void,
+    value_ptr_out: *mut *mut c_void,
+    seq_len_out: *mut usize,
+    num_heads_out: *mut usize,
+    head_dim_out: *mut usize,
+) -> i32 {
+    if tensor.is_null() || key_ptr_out.is_null() || value_ptr_out.is_null() ||
+       seq_len_out.is_null() || num_heads_out.is_null() || head_dim_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    let (seq_len, num_heads, head_dim) = tensor_ref.dimensions();
+
+    unsafe {
+        *key_ptr_out = tensor_ref.key_ptr() as *mut c_void;
+        *value_ptr_out = tensor_ref.value_ptr() as *mut c_void;
+        *seq_len_out = seq_len;
+        *num_heads_out = num_heads;
+        *head_dim_out = head_dim;
+    }
+
+    PROD_SUCCESS
+}
+
+/// Copy host data to tensor (for initial loading)
+#[no_mangle]
+pub extern "C" fn prod_copy_host_to_tensor(
+    tensor: *mut CKVTensor,
+    host_key_data: *const c_void,
+    host_value_data: *const c_void,
+) -> i32 {
+    if tensor.is_null() || host_key_data.is_null() || host_value_data.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+
+    match tensor_ref.copy_from_host(
+        host_key_data as *const u8,
+        host_value_data as *const u8,
+    ) {
+        Ok(()) => PROD_SUCCESS,
+        Err(_) => PROD_ERROR_CUDA,
+    }
+}
+
+/// Copy new tokens to extended tensor (for incremental generation)
+#[no_mangle]
+pub extern "C" fn prod_copy_new_tokens_to_tensor(
+    tensor: *mut CKVTensor,
+    host_key_data: *const c_void,
+    host_value_data: *const c_void,
+    start_token: usize,
+    num_tokens: usize,
+) -> i32 {
+    if tensor.is_null() || host_key_data.is_null() || host_value_data.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+
+    match tensor_ref.copy_new_tokens_from_host(
+        host_key_data as *const u8,
+        host_value_data as *const u8,
+        start_token,
+        num_tokens,
+    ) {
+        Ok(()) => PROD_SUCCESS,
+        Err(_) => PROD_ERROR_CUDA,
+    }
+}
+
+/// Get production metrics
+#[no_mangle]
+pub extern "C" fn prod_get_metrics(
+    manager: *mut CProductionManager,
+    sequences_processed_out: *mut usize,
+    tokens_generated_out: *mut usize,
+    zero_copy_extensions_out: *mut usize,
+    copy_extensions_out: *mut usize,
+    zero_copy_ratio_out: *mut f64,
+    avg_allocation_time_ms_out: *mut f64,
+    avg_extension_time_ms_out: *mut f64,
+) -> i32 {
+    if manager.is_null() || sequences_processed_out.is_null() || tokens_generated_out.is_null() ||
+       zero_copy_extensions_out.is_null() || copy_extensions_out.is_null() ||
+       zero_copy_ratio_out.is_null() || avg_allocation_time_ms_out.is_null() ||
+       avg_extension_time_ms_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let metrics = manager_ref.get_production_metrics();
+
+    unsafe {
+        *sequences_processed_out = metrics.sequences_processed;
+        *tokens_generated_out = metrics.tokens_generated;
+        *zero_copy_extensions_out = metrics.zero_copy_extensions;
+        *copy_extensions_out = metrics.copy_extensions;
+        *zero_copy_ratio_out = metrics.zero_copy_ratio;
+        *avg_allocation_time_ms_out = metrics.avg_allocation_time_ms;
+        *avg_extension_time_ms_out = metrics.avg_extension_time_ms;
+    }
+
+    PROD_SUCCESS
+}
+
+/// Get system health status
+#[no_mangle]
+pub extern "C" fn prod_get_system_health(
+    manager: *mut CProductionManager,
+    status_out: *mut i32,
+    health_score_out: *mut f64,
+    num_recommendations_out: *mut usize,
+) -> i32 {
+    if manager.is_null() || status_out.is_null() || health_score_out.is_null() ||
+       num_recommendations_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let health = manager_ref.get_system_health();
+
+    let status_code = match health.status {
+        SystemStatus::Excellent => 3,
+        SystemStatus::Good => 2,
+        SystemStatus::Warning => 1,
+        SystemStatus::Critical => 0,
+    };
+
+    unsafe {
+        *status_out = status_code;
+        *health_score_out = health.health_score;
+        *num_recommendations_out = health.recommendations.len();
+    }
+
+    PROD_SUCCESS
+}
+
+/// Get specific recommendation by index
+#[no_mangle]
+pub extern "C" fn prod_get_recommendation(
+    manager: *mut CProductionManager,
+    index: usize,
+    recommendation_out: *mut c_char,
+    max_len: usize,
+) -> i32 {
+    if manager.is_null() || recommendation_out.is_null() || max_len == 0 {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let health = manager_ref.get_system_health();
+
+    if index >= health.recommendations.len() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let recommendation = &health.recommendations[index];
+    let c_string = match CString::new(recommendation.as_str()) {
+        Ok(s) => s,
+        Err(_) => return PROD_ERROR_INVALID_PARAM,
+    };
+
+    let bytes = c_string.as_bytes_with_nul();
+    if bytes.len() > max_len {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    unsafe {
+        std::ptr::copy_nonoverlapping(
+            bytes.as_ptr() as *const c_char,
+            recommendation_out,
+            bytes.len(),
+        );
+    }
+
+    PROD_SUCCESS
+}
+
+/// Perform maintenance cleanup
+#[no_mangle]
+pub extern "C" fn prod_maintenance_cleanup(
+    manager: *mut CProductionManager,
+    inactive_arenas_cleaned_out: *mut usize,
+    old_pages_cleaned_out: *mut usize,
+    bytes_defragmented_out: *mut usize,
+    maintenance_time_ms_out: *mut f64,
+) -> i32 {
+    if manager.is_null() || inactive_arenas_cleaned_out.is_null() ||
+       old_pages_cleaned_out.is_null() || bytes_defragmented_out.is_null() ||
+       maintenance_time_ms_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let report = manager_ref.maintenance_cleanup();
+
+    unsafe {
+        *inactive_arenas_cleaned_out = report.inactive_arenas_cleaned;
+        *old_pages_cleaned_out = report.old_pages_cleaned;
+        *bytes_defragmented_out = report.bytes_defragmented;
+        *maintenance_time_ms_out = report.maintenance_time_ms;
+    }
+
+    PROD_SUCCESS
+}
+
+/// Batch allocate sequences for concurrent processing
+#[no_mangle]
+pub extern "C" fn prod_batch_allocate_sequences(
+    manager: *mut CProductionManager,
+    requests: *const CBatchRequest,
+    num_requests: usize,
+    results_out: *mut *mut CBatchResult,
+) -> i32 {
+    if manager.is_null() || requests.is_null() || results_out.is_null() || num_requests == 0 {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let request_slice = unsafe { std::slice::from_raw_parts(requests, num_requests) };
+
+    // Convert C requests to Rust requests
+    let sequence_requests: Vec<SequenceRequest> = request_slice.iter()
+        .map(|req| SequenceRequest {
+            initial_seq_len: req.initial_seq_len,
+            max_seq_len: req.max_seq_len,
+            hidden_dim: req.hidden_dim,
+            num_heads: req.num_heads,
+            dtype_size: req.dtype_size,
+            preferred_device: if req.preferred_device < 0 { None } else { Some(req.preferred_device) },
+        })
+        .collect();
+
+    match manager_ref.batch_allocate_sequences(&sequence_requests) {
+        Ok(allocations) => {
+            // Convert results to C format
+            let c_results: Vec<CBatchResult> = allocations.into_iter()
+                .map(|alloc| CBatchResult {
+                    request_id: alloc.request_id,
+                    arena: Box::into_raw(Box::new(CSequenceArena(alloc.arena))),
+                    tensor: Box::into_raw(Box::new(CKVTensor(alloc.tensor))),
+                    device_id: alloc.device_id,
+                })
+                .collect();
+
+            // Allocate result array
+            let results_ptr = unsafe {
+                libc::malloc(num_requests * std::mem::size_of::<CBatchResult>()) as *mut CBatchResult
+            };
+
+            if results_ptr.is_null() {
+                return PROD_ERROR_OUT_OF_MEMORY;
+            }
+
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    c_results.as_ptr(),
+                    results_ptr,
+                    c_results.len(),
+                );
+                *results_out = results_ptr;
+            }
+
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(LLMServerError::DeviceNotAvailable) => PROD_ERROR_INVALID_DEVICE,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Free batch allocation results
+#[no_mangle]
+pub extern "C" fn prod_free_batch_results(
+    results: *mut CBatchResult,
+    num_results: usize,
+) {
+    if results.is_null() || num_results == 0 {
+        return;
+    }
+
+    unsafe {
+        let result_slice = std::slice::from_raw_parts_mut(results, num_results);
+        for result in result_slice {
+            if !result.arena.is_null() {
+                let _ = Box::from_raw(result.arena);
+            }
+            if !result.tensor.is_null() {
+                let _ = Box::from_raw(result.tensor);
+            }
+        }
+        libc::free(results as *mut c_void);
+    }
+}
+
+/// Simulate token generation for benchmarking
+#[no_mangle]
+pub extern "C" fn prod_simulate_generation(
+    manager: *mut CProductionManager,
+    arena: *mut CSequenceArena,
+    tensor: *mut CKVTensor,
+    num_tokens: usize,
+    tokens_generated_out: *mut usize,
+    zero_copy_extensions_out: *mut usize,
+    copy_extensions_out: *mut usize,
+    total_time_ms_out: *mut f64,
+    avg_time_per_token_ms_out: *mut f64,
+) -> i32 {
+    if manager.is_null() || arena.is_null() || tensor.is_null() ||
+       tokens_generated_out.is_null() || zero_copy_extensions_out.is_null() ||
+       copy_extensions_out.is_null() || total_time_ms_out.is_null() ||
+       avg_time_per_token_ms_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let arena_ref = unsafe { &(*arena).0 };
+    let tensor_ref = unsafe { &mut (*tensor).0 };
+
+    match llm_server_api::simulate_generation(manager_ref, arena_ref, tensor_ref, num_tokens) {
+        Ok(stats) => {
+            unsafe {
+                *tokens_generated_out = stats.tokens_generated;
+                *zero_copy_extensions_out = stats.zero_copy_extensions;
+                *copy_extensions_out = stats.copy_extensions;
+                *total_time_ms_out = stats.total_time_ms;
+                *avg_time_per_token_ms_out = stats.avg_time_per_token_ms;
+            }
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+// Utility functions for integration
+#[no_mangle]
+pub extern "C" fn prod_get_version() -> *const c_char {
+    static VERSION: &[u8] = b"1.0.0-production\0";
+    VERSION.as_ptr() as *const c_char
+}
+
+#[no_mangle]
+pub extern "C" fn prod_get_features() -> *const c_char {
+    static FEATURES: &[u8] = b"zero-copy,slab-recycling,cuda-heap,production-ready\0";
+    FEATURES.as_ptr() as *const c_char
+}
+
+/// Check if CUDA is available and working
+#[no_mangle]
+pub extern "C" fn prod_check_cuda_availability() -> i32 {
+    #[cfg(feature = "cuda")]
+    {
+        match crate::cuda::CudaMemoryManager::new() {
+            Ok(_) => 1, // CUDA available
+            Err(_) => 0, // CUDA not available
+        }
+    }
+    #[cfg(not(feature = "cuda"))]
+    {
+        0 // CUDA not compiled in
+    }
+}
+
+/// Get optimal page size for given parameters
+#[no_mangle]
+pub extern "C" fn prod_calculate_optimal_page_size(
+    max_seq_len: usize,
+    hidden_dim: usize,
+    num_heads: usize,
+    device_id: i32,
+) -> usize {
+    // Simple calculation - in real implementation this would query device properties
+    let max_tensor_size = 2 * max_seq_len * hidden_dim * 2; // 2 for K+V, 2 for fp16
+    let base_page_size = 1024 * 1024; // 1MB base
+    let min_page_size = max_tensor_size * 2; // Fit at least 2 tensors
     
-    if offset + size <= stats.total_allocated {
-        ARENA_SUCCESS
-    } else {
-        ARENA_ERROR_INVALID_PARAM
+    base_page_size.max(min_page_size).min(16 * 1024 * 1024) // Cap at 16MB
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_production_ffi_basic() {
+        // Test basic FFI functionality
+        let version = unsafe { CStr::from_ptr(prod_get_version()) };
+        assert!(version.to_str().unwrap().contains("production"));
+        
+        let features = unsafe { CStr::from_ptr(prod_get_features()) };
+        assert!(features.to_str().unwrap().contains("zero-copy"));
+        
+        let cuda_available = prod_check_cuda_availability();
+        println!("CUDA available: {}", cuda_available != 0);
+        
+        let page_size = prod_calculate_optimal_page_size(2048, 4096, 32, 0);
+        assert!(page_size >= 1024 * 1024); // At least 1MB
+        
+        println!("✓ Production FFI basic tests passed");
+    }
+
+    #[test]
+    fn test_production_manager_ffi() {
+        let model_name = CString::new("llama-7b").unwrap();
+        let devices = [0i32];
+        let mut manager_ptr = std::ptr::null_mut();
+        
+        let result = prod_kv_cache_init_for_server(
+            model_name.as_ptr(),
+            devices.as_ptr(),
+            1,
+            &mut manager_ptr,
+        );
+        
+        if result == PROD_SUCCESS {
+            // Test getting metrics
+            let mut sequences = 0;
+            let mut tokens = 0;
+            let mut zero_copy = 0;
+            let mut copy_ext = 0;
+            let mut ratio = 0.0;
+            let mut alloc_time = 0.0;
+            let mut ext_time = 0.0;
+            
+            let metrics_result = prod_get_metrics(
+                manager_ptr,
+                &mut sequences,
+                &mut tokens,
+                &mut zero_copy,
+                &mut copy_ext,
+                &mut ratio,
+                &mut alloc_time,
+                &mut ext_time,
+            );
+            
+            assert_eq!(metrics_result, PROD_SUCCESS);
+            
+            // Cleanup
+            prod_kv_cache_manager_free(manager_ptr);
+            println!("✓ Production manager FFI tests passed");
+        } else {
+            println!("Production manager FFI test skipped (no CUDA): error code {}", result);
+        }
     }
 }

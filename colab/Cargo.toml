@@ -1,0 +1,32 @@
+[package]
+name = "arena_kv_cache"
+version = "1.0.0"
+edition = "2021"
+
+[lib]
+name = "arena_kv_cache"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+crossbeam = "0.8"
+log = "0.4"
+
+[features]
+default = []
+python = ["pyo3"]
+cuda = ["cudarc"]
+examples = []
+
+[dependencies.pyo3]
+version = "0.20"
+features = ["extension-module"]
+optional = true
+
+[dependencies.cudarc]
+version = "0.10"
+optional = true
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
