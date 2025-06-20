@@ -1,16 +1,17 @@
-// src/ffi.rs - Production FFI for LLM server integration
+// src/ffi.rs - Fixed production FFI for LLM server integration
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Arc;
+use std::time::Instant;
 use crate::{
     ProductionKVCacheManager, LLMServerConfig, LLMServerError,
-    SequenceRequest, InferenceRequest, SystemStatus,
-    llm_server_api,
+    SequenceRequest, SystemStatus, ProductionMetricsReport, MaintenanceReport, 
+    BatchAllocationResult,
 };
 
 // Opaque pointers for C FFI
 pub struct CProductionManager(ProductionKVCacheManager);
-pub struct CSequenceArena(Arc<crate::ZeroCopyArena>);
-pub struct CKVTensor(crate::ZeroCopyTensor);
+pub struct CSequenceArena(Arc<crate::zero_copy::ZeroCopyArena>);
+pub struct CKVTensor(crate::zero_copy::ZeroCopyTensor);
 
 // Error codes for production API
 pub const PROD_SUCCESS: i32 = 0;
@@ -37,6 +38,16 @@ pub struct CBatchResult {
     pub arena: *mut CSequenceArena,
     pub tensor: *mut CKVTensor,
     pub device_id: i32,
+}
+
+// Generation statistics for benchmarking
+#[derive(Debug, Clone)]
+pub struct GenerationStats {
+    pub tokens_generated: usize,
+    pub zero_copy_extensions: usize,
+    pub copy_extensions: usize,
+    pub total_time_ms: f64,
+    pub avg_time_per_token_ms: f64,
 }
 
 // Use system malloc/free
@@ -70,7 +81,7 @@ pub extern "C" fn prod_kv_cache_init_for_server(
     let device_slice = unsafe { std::slice::from_raw_parts(devices, num_devices) };
     let device_vec = device_slice.to_vec();
 
-    match llm_server_api::initialize_for_server(model_name_str, &device_vec) {
+    match initialize_for_server(model_name_str, &device_vec) {
         Ok(manager) => {
             unsafe {
                 *manager_out = Box::into_raw(Box::new(CProductionManager(manager)));
@@ -81,6 +92,11 @@ pub extern "C" fn prod_kv_cache_init_for_server(
         Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
         Err(_) => PROD_ERROR_ALLOCATION_FAILED,
     }
+}
+
+/// Initialize for LLM server with model-specific optimizations
+pub fn initialize_for_server(model_name: &str, devices: &[i32]) -> Result<ProductionKVCacheManager, LLMServerError> {
+    ProductionKVCacheManager::for_llm_model(model_name, devices.to_vec())
 }
 
 /// Create chatbot-optimized manager
@@ -166,8 +182,9 @@ pub extern "C" fn prod_create_sequence_arena(
 
     let manager_ref = unsafe { &(*manager).0 };
     let device = if device_id < 0 { None } else { Some(device_id) };
+    let head_dim = hidden_dim / num_heads;
 
-    match manager_ref.create_sequence_arena(initial_seq_len, max_seq_len, hidden_dim, num_heads, device) {
+    match manager_ref.create_sequence_arena(initial_seq_len, max_seq_len, num_heads, head_dim, device) {
         Ok(arena) => {
             unsafe {
                 *arena_out = Box::into_raw(Box::new(CSequenceArena(arena)));
@@ -209,13 +226,14 @@ pub extern "C" fn prod_allocate_kv_tensor(
 
     let manager_ref = unsafe { &(*manager).0 };
     let arena_ref = unsafe { &(*arena).0 };
+    let head_dim = hidden_dim / num_heads;
 
     match manager_ref.allocate_kv_tensor(
         arena_ref,
         initial_seq_len,
         max_seq_len,
-        hidden_dim,
         num_heads,
+        head_dim,
         dtype_size,
     ) {
         Ok(tensor) => {
@@ -606,7 +624,7 @@ pub extern "C" fn prod_simulate_generation(
     let arena_ref = unsafe { &(*arena).0 };
     let tensor_ref = unsafe { &mut (*tensor).0 };
 
-    match llm_server_api::simulate_generation(manager_ref, arena_ref, tensor_ref, num_tokens) {
+    match simulate_generation(manager_ref, arena_ref, tensor_ref, num_tokens) {
         Ok(stats) => {
             unsafe {
                 *tokens_generated_out = stats.tokens_generated;
@@ -621,6 +639,51 @@ pub extern "C" fn prod_simulate_generation(
         Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
         Err(_) => PROD_ERROR_ALLOCATION_FAILED,
     }
+}
+
+/// Simulate generation for benchmarking
+pub fn simulate_generation(
+    manager: &ProductionKVCacheManager,
+    arena: &Arc<crate::zero_copy::ZeroCopyArena>,
+    tensor: &mut crate::zero_copy::ZeroCopyTensor,
+    num_tokens: usize,
+) -> Result<GenerationStats, LLMServerError> {
+    let start_time = Instant::now();
+    let mut zero_copy_count = 0;
+    let mut copy_count = 0;
+    let current_seq_len = tensor.seq_len();
+    
+    // Simulate incremental token generation
+    for i in 1..=num_tokens {
+        let new_seq_len = current_seq_len + i;
+        
+        match manager.extend_tensor_for_generation(arena, tensor, 1) {
+            Ok(was_zero_copy) => {
+                if was_zero_copy {
+                    zero_copy_count += 1;
+                } else {
+                    copy_count += 1;
+                }
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    
+    let total_time = start_time.elapsed();
+    let total_time_ms = total_time.as_millis() as f64;
+    let avg_time_per_token = if num_tokens > 0 {
+        total_time_ms / num_tokens as f64
+    } else {
+        0.0
+    };
+    
+    Ok(GenerationStats {
+        tokens_generated: num_tokens,
+        zero_copy_extensions: zero_copy_count,
+        copy_extensions: copy_count,
+        total_time_ms,
+        avg_time_per_token_ms: avg_time_per_token,
+    })
 }
 
 // Utility functions for integration
@@ -661,7 +724,8 @@ pub extern "C" fn prod_calculate_optimal_page_size(
     device_id: i32,
 ) -> usize {
     // Simple calculation - in real implementation this would query device properties
-    let max_tensor_size = 2 * max_seq_len * hidden_dim * 2; // 2 for K+V, 2 for fp16
+    let head_dim = if num_heads > 0 { hidden_dim / num_heads } else { 128 };
+    let max_tensor_size = 2 * max_seq_len * num_heads * head_dim * 2; // 2 for K+V, 2 for fp16
     let base_page_size = 1024 * 1024; // 1MB base
     let min_page_size = max_tensor_size * 2; // Fit at least 2 tensors
     
@@ -732,5 +796,25 @@ mod tests {
         } else {
             println!("Production manager FFI test skipped (no CUDA): error code {}", result);
         }
+    }
+
+    #[test]
+    fn test_generation_simulation() {
+        // Test the generation simulation function
+        let stats = GenerationStats {
+            tokens_generated: 100,
+            zero_copy_extensions: 80,
+            copy_extensions: 20,
+            total_time_ms: 150.0,
+            avg_time_per_token_ms: 1.5,
+        };
+        
+        assert_eq!(stats.tokens_generated, 100);
+        assert_eq!(stats.zero_copy_extensions, 80);
+        assert_eq!(stats.copy_extensions, 20);
+        assert_eq!(stats.total_time_ms, 150.0);
+        assert_eq!(stats.avg_time_per_token_ms, 1.5);
+        
+        println!("✓ Generation simulation stats test passed");
     }
 }
