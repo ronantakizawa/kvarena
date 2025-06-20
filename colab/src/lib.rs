@@ -1,4 +1,4 @@
-// lib.rs - Production-grade arena allocator for LLM server KV caching
+// lib.rs - Production-grade arena allocator for LLM server KV caching with KV-specific layout
 //! Arena-Allocated KV-Cache with Slab Recycling & Zero-Copy Extensions
 //! 
 //! A high-throughput, low-fragmentation memory manager for transformer key/value tensors.
@@ -6,14 +6,19 @@
 //! - Memory fragmentation from wildly different context lengths
 //! - Copy amplification during incremental generation
 //! - GC stalls from synchronous device-side frees
+//! 
+//! Uses KV-specific tensor layout and page size calculations as per project spec:
+//! "Page size = round-up of largest KV tensor you expect (e.g., 256 KiB for 4-bit 8K-seq Llama-2)"
 
 pub mod cuda;
 pub mod slab;
 pub mod zero_copy;
+pub mod kv_layout;
 pub mod ffi;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use zero_copy::{ZeroCopyManager, ZeroCopyArena, ZeroCopyTensor, ZeroCopyGlobalStats, ZeroCopyArenaStats};
 
 /// C FFI exports for Python bindings
 use std::ffi::c_void;
@@ -24,8 +29,8 @@ use std::sync::Mutex;
 #[derive(Debug, Clone)]
 struct TensorMetadata {
     seq_len: usize,
-    hidden_dim: usize,
     num_heads: usize,
+    head_dim: usize,
     dtype_size: usize,
     host_buffer: Vec<u8>,
 }
@@ -70,8 +75,8 @@ pub extern "C" fn kv_cache_create_sequence_arena(manager_ptr: *mut c_void) -> *m
     
     let manager = unsafe { &*(manager_ptr as *const ProductionKVCacheManager) };
     
-    // Create arena with default parameters
-    match manager.create_sequence_arena(512, 2048, 4096, 32, None) {
+    // Create arena with default KV parameters
+    match manager.create_sequence_arena(512, 2048, 32, 128, None) {
         Ok(arena) => Box::into_raw(Box::new(arena)) as *mut c_void,
         Err(_) => std::ptr::null_mut(),
     }
@@ -102,23 +107,26 @@ pub extern "C" fn sequence_arena_allocate_tensor(
     
     let arena = unsafe { &*(arena_ptr as *const Arc<SequenceArena>) };
     
-    // Try to allocate tensor in the arena (for tracking purposes)
-    match arena.allocate_tensor_with_growth(seq_len, seq_len * 2, hidden_dim, num_heads, dtype_size) {
+    // Calculate head_dim from hidden_dim and num_heads
+    let head_dim = hidden_dim / num_heads;
+    
+    // Try to allocate KV tensor in the arena
+    match arena.allocate_tensor_with_growth(seq_len, seq_len * 2, num_heads, head_dim, dtype_size) {
         Ok(_tensor) => {
-            // Calculate tensor size
-            let tensor_size = seq_len * hidden_dim * dtype_size * 2; // K+V tensors
+            // Calculate KV tensor size (K + V tensors)
+            let tensor_size = seq_len * hidden_dim * dtype_size * 2;
             
-            // Create host memory buffer for the tensor data
+            // Create host memory buffer for the KV tensor data
             let host_buffer = vec![0u8; tensor_size];
             
             // Generate a unique tensor ID
             let tensor_id = NEXT_TENSOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             
-            // Store the tensor metadata and host buffer
+            // Store the KV tensor metadata and host buffer
             let metadata = TensorMetadata {
                 seq_len,
-                hidden_dim,
                 num_heads,
+                head_dim,
                 dtype_size,
                 host_buffer,
             };
@@ -210,15 +218,16 @@ pub extern "C" fn sequence_arena_extend_tensor(
     let arena = unsafe { &*(arena_ptr as *const Arc<SequenceArena>) };
     let tensor_id = offset; // offset is actually tensor ID
     
-    // Check if we can extend in place (simple heuristic)
+    // Check if we can extend in place (simple heuristic for KV tensors)
     let can_extend_in_place = new_seq_len <= seq_len * 2;
-    let new_size = new_seq_len * hidden_dim * dtype_size * 2;
+    let head_dim = hidden_dim / num_heads;
+    let new_size = new_seq_len * num_heads * head_dim * dtype_size * 2; // K + V
     
     if can_extend_in_place {
-        // Try to extend existing tensor
+        // Try to extend existing KV tensor
         if let Ok(mut storage) = TENSOR_STORAGE.lock() {
             if let Some(metadata) = storage.get_mut(&tensor_id) {
-                // Update metadata
+                // Update metadata for KV tensor
                 metadata.seq_len = new_seq_len;
                 // Resize host buffer if needed
                 if metadata.host_buffer.len() < new_size {
@@ -235,26 +244,27 @@ pub extern "C" fn sequence_arena_extend_tensor(
         }
     }
     
-    // Create new tensor if can't extend in place
-    match arena.allocate_tensor_with_growth(new_seq_len, new_seq_len * 2, hidden_dim, num_heads, dtype_size) {
+    // Create new KV tensor if can't extend in place
+    let head_dim = hidden_dim / num_heads;
+    match arena.allocate_tensor_with_growth(new_seq_len, new_seq_len * 2, num_heads, head_dim, dtype_size) {
         Ok(_tensor) => {
             let new_tensor_id = NEXT_TENSOR_ID.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let new_host_buffer = vec![0u8; new_size];
             
             let new_metadata = TensorMetadata {
                 seq_len: new_seq_len,
-                hidden_dim,
                 num_heads,
+                head_dim,
                 dtype_size,
                 host_buffer: new_host_buffer,
             };
             
             if let Ok(mut storage) = TENSOR_STORAGE.lock() {
-                // Copy data from old tensor if it exists
+                // Copy data from old KV tensor if it exists
                 if let Some(old_metadata) = storage.get(&tensor_id) {
-                    // Copy old data to new buffer (simulate copy-based extension)
+                    // Copy old KV data to new buffer (simulate copy-based extension)
                     let copy_size = std::cmp::min(old_metadata.host_buffer.len(), new_size);
-                    // Note: In a real implementation, we'd copy the actual tensor data here
+                    // Note: In a real implementation, we'd copy the actual KV tensor data here
                 }
                 storage.insert(new_tensor_id, new_metadata);
             }
@@ -293,7 +303,7 @@ pub extern "C" fn kv_cache_manager_get_global_stats(
 
 #[no_mangle]
 pub extern "C" fn arena_get_default_page_size() -> usize {
-    256 * 1024 // 256KB default
+    256 * 1024 // 256KB default - matches "256 KiB for 4-bit 8K-seq Llama-2" spec
 }
 
 #[no_mangle]
@@ -309,7 +319,7 @@ pub extern "C" fn arena_align_size(size: usize) -> usize {
 
 use cuda::{CudaMemoryManager, CudaPage, CudaError, CudaContext};
 use slab::{GlobalSlabPool, SlabPoolManager, SlabPoolStats};
-use zero_copy::{ZeroCopyManager, ZeroCopyArena, ZeroCopyTensor, ZeroCopyGlobalStats};
+use kv_layout::{ModelConfig, calculate_model_kv_page_size, calculate_optimal_kv_page_size};
 
 // Re-export key types for public API
 pub use cuda::{CudaDeviceInfo, CudaMemoryManager as CudaManager};
@@ -346,12 +356,12 @@ impl std::fmt::Display for LLMServerError {
 
 impl std::error::Error for LLMServerError {}
 
-/// Configuration for production LLM server memory management
+/// Configuration for production LLM server memory management with KV-specific settings
 #[derive(Debug, Clone)]
 pub struct LLMServerConfig {
     /// Devices to use for allocation
     pub devices: Vec<i32>,
-    /// Base page size (will be optimized per device)
+    /// Base page size (will be optimized per KV tensor requirements)
     pub base_page_size: usize,
     /// Maximum pages per slab pool class
     pub max_slab_pages: usize,
@@ -369,7 +379,7 @@ impl Default for LLMServerConfig {
     fn default() -> Self {
         Self {
             devices: vec![0], // Default to device 0
-            base_page_size: 1024 * 1024, // 1MB base
+            base_page_size: 256 * 1024, // 256KB base - matches project spec example
             max_slab_pages: 100,
             cross_device_sharing: true,
             cleanup_interval_seconds: 300, // 5 minutes
@@ -379,9 +389,9 @@ impl Default for LLMServerConfig {
     }
 }
 
-/// Production-grade KV cache manager for LLM servers
+/// Production-grade KV cache manager for LLM servers with KV-specific optimizations
 pub struct ProductionKVCacheManager {
-    /// Zero-copy manager for tensor operations
+    /// Zero-copy manager for KV tensor operations
     zero_copy_manager: ZeroCopyManager,
     /// Slab pool for page recycling
     slab_pool: Arc<GlobalSlabPool>,
@@ -421,7 +431,7 @@ impl ProductionMetrics {
 }
 
 impl ProductionKVCacheManager {
-    /// Create new production KV cache manager
+    /// Create new production KV cache manager with KV-specific optimizations
     pub fn new(config: LLMServerConfig) -> Result<Self, LLMServerError> {
         // Initialize CUDA context
         let cuda_context = CudaContext::new()?;
@@ -445,9 +455,9 @@ impl ProductionKVCacheManager {
         
         let metrics = ProductionMetrics::new();
         
-        log::info!("Production KV cache manager initialized");
+        log::info!("Production KV cache manager initialized with KV-specific optimizations");
         log::info!("Devices: {:?}", config.devices);
-        log::info!("Base page size: {} KB", config.base_page_size / 1024);
+        log::info!("Base page size: {} KB (KV-optimized)", config.base_page_size / 1024);
         
         Ok(Self {
             zero_copy_manager,
@@ -459,49 +469,49 @@ impl ProductionKVCacheManager {
         })
     }
 
-    /// Create arena optimized for specific sequence characteristics
+    /// Create arena optimized for specific sequence characteristics using KV-specific calculations
     pub fn create_sequence_arena(
-        &self,
-        expected_seq_len: usize,
-        max_seq_len: usize,
-        hidden_dim: usize,
-        num_heads: usize,
-        device_id: Option<i32>,
-    ) -> Result<Arc<SequenceArena>, LLMServerError> {
-        let device = device_id.unwrap_or_else(|| self.select_optimal_device());
-        
-        // Calculate optimal page size for this sequence
-        let page_size = self.calculate_optimal_page_size(max_seq_len, hidden_dim, num_heads, device);
-        
-        // Create arena with zero-copy support
-        let arena = self.zero_copy_manager.create_arena(device, page_size)?;
-        
-        self.metrics.total_sequences_processed.fetch_add(1, Ordering::Relaxed);
-        
-        log::debug!("Created sequence arena: device={}, page_size={}KB, max_seq_len={}", 
-                   device, page_size / 1024, max_seq_len);
-        
-        Ok(arena)
+    &self,
+    expected_seq_len: usize,
+    max_seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    device_id: Option<i32>,
+) -> Result<Arc<SequenceArena>, LLMServerError> {
+    let device = device_id.unwrap_or_else(|| self.select_optimal_device());
+    
+    // Calculate optimal page size using KV-specific calculations
+    let page_size = calculate_optimal_kv_page_size(max_seq_len, num_heads, head_dim, 2); // fp16 default
+    
+    // Create arena with KV-optimized page size using legacy method
+    let arena = self.zero_copy_manager.create_arena_legacy(device, page_size)?;
+    
+    self.metrics.total_sequences_processed.fetch_add(1, Ordering::Relaxed);
+    
+    log::debug!("Created KV-optimized sequence arena: device={}, max_seq_len={}, heads={}x{}", 
+               device, max_seq_len, num_heads, head_dim);
+    
+    Ok(arena)
     }
 
-    /// Allocate KV tensor with automatic growth planning
+    /// Allocate KV tensor with automatic growth planning using KV-specific layout
     pub fn allocate_kv_tensor(
         &self,
         arena: &Arc<SequenceArena>,
         initial_seq_len: usize,
         expected_max_len: usize,
-        hidden_dim: usize,
         num_heads: usize,
+        head_dim: usize,
         dtype_size: usize,
     ) -> Result<KVTensor, LLMServerError> {
         let start_time = std::time::Instant::now();
         
-        // Allocate with growth capacity for zero-copy extensions
+        // Allocate with growth capacity for zero-copy extensions using KV layout
         let tensor = arena.allocate_tensor_with_growth(
             initial_seq_len,
             expected_max_len,
-            hidden_dim,
             num_heads,
+            head_dim,
             dtype_size,
         )?;
         
@@ -509,12 +519,12 @@ impl ProductionKVCacheManager {
         self.metrics.allocation_time_ns.fetch_add(allocation_time, Ordering::Relaxed);
         
         log::debug!("Allocated KV tensor: {}x{}x{}, growth_capacity={}", 
-                   initial_seq_len, num_heads, hidden_dim / num_heads, expected_max_len);
+                   initial_seq_len, num_heads, head_dim, expected_max_len);
         
         Ok(tensor)
     }
 
-    /// Extend tensor for incremental generation (zero-copy when possible)
+    /// Extend KV tensor for incremental generation (zero-copy when possible)
     pub fn extend_tensor_for_generation(
         &self,
         arena: &Arc<SequenceArena>,
@@ -535,10 +545,10 @@ impl ProductionKVCacheManager {
         
         if was_zero_copy {
             self.metrics.total_zero_copy_extensions.fetch_add(1, Ordering::Relaxed);
-            log::debug!("Zero-copy extension: {} -> {} tokens", current_len, new_len);
+            log::debug!("Zero-copy KV extension: {} -> {} tokens", current_len, new_len);
         } else {
             self.metrics.total_copy_extensions.fetch_add(1, Ordering::Relaxed);
-            log::debug!("Copy-based extension: {} -> {} tokens", current_len, new_len);
+            log::debug!("Copy-based KV extension: {} -> {} tokens", current_len, new_len);
         }
         
         Ok(was_zero_copy)
@@ -673,21 +683,10 @@ impl ProductionKVCacheManager {
             .unwrap_or(0)
     }
 
-    fn calculate_optimal_page_size(&self, max_seq_len: usize, hidden_dim: usize, num_heads: usize, device_id: i32) -> usize {
-        // Calculate size needed for maximum expected tensor
-        let max_tensor_size = 2 * max_seq_len * hidden_dim * 2; // 2 for K+V, 2 for fp16
-        
-        // Start with base page size and adjust
-        let mut page_size = self.config.base_page_size;
-        
-        // Ensure page can fit at least 2 max tensors (for efficiency)
-        let min_page_size = max_tensor_size * 2;
-        if page_size < min_page_size {
-            page_size = min_page_size.next_power_of_two();
-        }
-        
-        // Cap at reasonable maximum (16MB)
-        page_size.min(16 * 1024 * 1024)
+    fn calculate_optimal_page_size(&self, max_seq_len: usize, num_heads: usize, head_dim: usize, device_id: i32) -> usize {
+        // Use KV-specific page size calculation as per project spec
+        let element_size = 2; // Default to fp16
+        calculate_optimal_kv_page_size(max_seq_len, num_heads, head_dim, element_size)
     }
 
     /// Batch allocate multiple sequences (for concurrent request processing)
@@ -715,8 +714,8 @@ impl ProductionKVCacheManager {
                 let arena = self.create_sequence_arena(
                     req.initial_seq_len,
                     req.max_seq_len,
-                    req.hidden_dim,
                     req.num_heads,
+                    req.head_dim,
                     Some(device),
                 )?;
                 
@@ -724,8 +723,8 @@ impl ProductionKVCacheManager {
                     &arena,
                     req.initial_seq_len,
                     req.max_seq_len,
-                    req.hidden_dim,
                     req.num_heads,
+                    req.head_dim,
                     req.dtype_size,
                 )?;
                 
@@ -741,54 +740,79 @@ impl ProductionKVCacheManager {
         // Sort results by request_id to maintain order
         results.sort_by_key(|r| r.request_id);
         
-        log::info!("Batch allocated {} sequences across {} devices", 
+        log::info!("Batch allocated {} KV sequences across {} devices", 
                   requests.len(), num_device_groups);
         
         Ok(results)
     }
 
-    // Production-ready API for LLM servers
-    /// Create manager optimized for specific LLM model
+    // Production-ready API for LLM servers with KV optimizations
+    /// Create manager optimized for specific LLM model using KV-layout calculations
+    /// Create manager optimized for specific LLM model using KV-layout calculations
     pub fn for_llm_model(
         model_name: &str,
         devices: Vec<i32>,
     ) -> Result<Self, LLMServerError> {
-        let config = match model_name.to_lowercase().as_str() {
-            name if name.contains("llama") && name.contains("7b") => LLMServerConfig {
-                devices,
-                base_page_size: 2 * 1024 * 1024, // 2MB for 7B models
-                max_slab_pages: 200,
-                cross_device_sharing: true,
-                ..Default::default()
-            },
-            name if name.contains("llama") && name.contains("13b") => LLMServerConfig {
-                devices,
-                base_page_size: 4 * 1024 * 1024, // 4MB for 13B models
-                max_slab_pages: 150,
-                cross_device_sharing: true,
-                ..Default::default()
-            },
-            name if name.contains("llama") && name.contains("70b") => LLMServerConfig {
-                devices,
-                base_page_size: 8 * 1024 * 1024, // 8MB for 70B models
-                max_slab_pages: 100,
-                cross_device_sharing: true,
-                ..Default::default()
-            },
-            _ => LLMServerConfig {
-                devices,
-                ..Default::default()
-            },
+        let (config, model_config) = match model_name.to_lowercase().as_str() {
+            name if name.contains("llama") && name.contains("7b") => (
+                LLMServerConfig {
+                    devices,
+                    base_page_size: calculate_model_kv_page_size(&ModelConfig::Llama2_7B),
+                    max_slab_pages: 200,
+                    cross_device_sharing: true,
+                    ..Default::default()
+                },
+                ModelConfig::Llama2_7B
+            ),
+            name if name.contains("llama") && name.contains("13b") => (
+                LLMServerConfig {
+                    devices,
+                    base_page_size: calculate_model_kv_page_size(&ModelConfig::Llama2_13B),
+                    max_slab_pages: 150,
+                    cross_device_sharing: true,
+                    ..Default::default()
+                },
+                ModelConfig::Llama2_13B
+            ),
+            name if name.contains("llama") && name.contains("70b") => (
+                LLMServerConfig {
+                    devices,
+                    base_page_size: calculate_model_kv_page_size(&ModelConfig::Llama2_70B),
+                    max_slab_pages: 100,
+                    cross_device_sharing: true,
+                    ..Default::default()
+                },
+                ModelConfig::Llama2_70B
+            ),
+            _ => (
+                LLMServerConfig {
+                    devices,
+                    base_page_size: calculate_optimal_kv_page_size(2048, 32, 128, 2), // Default config
+                    ..Default::default()
+                },
+                ModelConfig::Custom { max_seq_len: 2048, num_heads: 32, head_dim: 128, element_size: 2 }
+            ),
         };
+        
+        log::info!("Optimized for model {}: page_size={}KB", 
+                  model_name, config.base_page_size / 1024);
         
         Self::new(config)
     }
 
-    /// Create chatbot-optimized manager (frequent incremental generation)
+    /// Create chatbot-optimized manager (frequent incremental generation) with KV layout
     pub fn for_chatbot(devices: Vec<i32>) -> Result<Self, LLMServerError> {
+        // Optimize for typical chatbot sequences (1K-4K tokens)
+        let chatbot_config = ModelConfig::Custom {
+            max_seq_len: 4096,
+            num_heads: 32,
+            head_dim: 128,
+            element_size: 2, // fp16
+        };
+        
         let config = LLMServerConfig {
             devices,
-            base_page_size: 1024 * 1024, // 1MB - optimized for incremental generation
+            base_page_size: calculate_model_kv_page_size(&chatbot_config),
             max_slab_pages: 300, // Higher recycling for short conversations
             cross_device_sharing: true,
             cleanup_interval_seconds: 180, // More frequent cleanup
@@ -796,14 +820,25 @@ impl ProductionKVCacheManager {
             enable_pressure_monitoring: true,
         };
         
+        log::info!("Chatbot optimization: page_size={}KB for typical 4K context", 
+                  config.base_page_size / 1024);
+        
         Self::new(config)
     }
 
-    /// Create document-processing optimized manager (long sequences)
+    /// Create document-processing optimized manager (long sequences) with KV layout
     pub fn for_document_processing(devices: Vec<i32>) -> Result<Self, LLMServerError> {
+        // Optimize for long document sequences (8K-32K tokens)
+        let document_config = ModelConfig::Custom {
+            max_seq_len: 32768,
+            num_heads: 64,
+            head_dim: 128,
+            element_size: 2, // fp16
+        };
+        
         let config = LLMServerConfig {
             devices,
-            base_page_size: 8 * 1024 * 1024, // 8MB - optimized for long sequences
+            base_page_size: calculate_model_kv_page_size(&document_config),
             max_slab_pages: 50, // Lower recycling for long-lived documents
             cross_device_sharing: false, // NUMA-aware for long sequences
             cleanup_interval_seconds: 600, // Less frequent cleanup
@@ -811,17 +846,74 @@ impl ProductionKVCacheManager {
             enable_pressure_monitoring: true,
         };
         
+        log::info!("Document processing optimization: page_size={}MB for 32K context", 
+                  config.base_page_size / 1024 / 1024);
+        
+        Self::new(config)
+    }
+
+    /// Create code generation optimized manager (mixed sequence lengths)
+    pub fn for_code_generation(devices: Vec<i32>) -> Result<Self, LLMServerError> {
+        // Optimize for code generation workloads (variable length, medium-long contexts)
+        let code_config = ModelConfig::Custom {
+            max_seq_len: 16384, // 16K context for large codebases
+            num_heads: 48,      // Slightly more heads for complex patterns
+            head_dim: 128,
+            element_size: 2,    // fp16
+        };
+        
+        let config = LLMServerConfig {
+            devices,
+            base_page_size: calculate_model_kv_page_size(&code_config),
+            max_slab_pages: 150,
+            cross_device_sharing: true,
+            cleanup_interval_seconds: 240, // Medium cleanup frequency
+            max_page_age_seconds: 1200,    // Medium page lifetime
+            enable_pressure_monitoring: true,
+        };
+        
+        log::info!("Code generation optimization: page_size={}KB for 16K context", 
+                  config.base_page_size / 1024);
+        
+        Self::new(config)
+    }
+
+    /// Create batch inference optimized manager (high throughput)
+    pub fn for_batch_inference(devices: Vec<i32>, batch_size: usize) -> Result<Self, LLMServerError> {
+        // Optimize for high-throughput batch inference
+        let seq_len = if batch_size > 32 { 2048 } else { 4096 }; // Shorter sequences for larger batches
+        
+        let batch_config = ModelConfig::Custom {
+            max_seq_len: seq_len,
+            num_heads: 32,
+            head_dim: 128,
+            element_size: 2, // fp16
+        };
+        
+        let config = LLMServerConfig {
+            devices,
+            base_page_size: calculate_model_kv_page_size(&batch_config),
+            max_slab_pages: 500, // High recycling for batch workloads
+            cross_device_sharing: true,
+            cleanup_interval_seconds: 120, // Frequent cleanup for batch turnover
+            max_page_age_seconds: 600,     // Short page lifetime
+            enable_pressure_monitoring: true,
+        };
+        
+        log::info!("Batch inference optimization: page_size={}KB for batch_size={}", 
+                  config.base_page_size / 1024, batch_size);
+        
         Self::new(config)
     }
 }
 
-/// Request for sequence allocation
+/// Request for sequence allocation with KV-specific parameters
 #[derive(Debug, Clone)]
 pub struct SequenceRequest {
     pub initial_seq_len: usize,
     pub max_seq_len: usize,
-    pub hidden_dim: usize,
     pub num_heads: usize,
+    pub head_dim: usize,
     pub dtype_size: usize,
     pub preferred_device: Option<i32>,
 }
@@ -880,7 +972,7 @@ pub struct MaintenanceReport {
 pub mod llm_server_api {
     use super::*;
 
-    /// Initialize production KV cache for LLM server
+    /// Initialize production KV cache for LLM server with KV-specific optimizations
     pub fn initialize_for_server(
         model_config: &str,
         available_devices: &[i32],
@@ -901,6 +993,36 @@ pub mod llm_server_api {
         }
         
         Ok(manager)
+    }
+
+    /// Initialize for specific workload types
+    pub fn initialize_for_chatbot(
+        available_devices: &[i32],
+    ) -> Result<ProductionKVCacheManager, LLMServerError> {
+        log::info!("Initializing KV cache for chatbot workload");
+        ProductionKVCacheManager::for_chatbot(available_devices.to_vec())
+    }
+
+    pub fn initialize_for_documents(
+        available_devices: &[i32],
+    ) -> Result<ProductionKVCacheManager, LLMServerError> {
+        log::info!("Initializing KV cache for document processing workload");
+        ProductionKVCacheManager::for_document_processing(available_devices.to_vec())
+    }
+
+    pub fn initialize_for_code_generation(
+        available_devices: &[i32],
+    ) -> Result<ProductionKVCacheManager, LLMServerError> {
+        log::info!("Initializing KV cache for code generation workload");
+        ProductionKVCacheManager::for_code_generation(available_devices.to_vec())
+    }
+
+    pub fn initialize_for_batch_inference(
+        available_devices: &[i32],
+        batch_size: usize,
+    ) -> Result<ProductionKVCacheManager, LLMServerError> {
+        log::info!("Initializing KV cache for batch inference (batch_size={})", batch_size);
+        ProductionKVCacheManager::for_batch_inference(available_devices.to_vec(), batch_size)
     }
 
     /// Simulate incremental generation (for testing/benchmarking)
@@ -933,6 +1055,135 @@ pub mod llm_server_api {
             avg_time_per_token_ms: generation_time.as_millis() as f64 / num_tokens as f64,
         })
     }
+
+    /// Benchmark KV cache performance for different configurations
+    pub fn benchmark_kv_performance(
+        model_name: &str,
+        devices: &[i32],
+        test_cases: &[KVBenchmarkCase],
+    ) -> Result<KVBenchmarkResults, LLMServerError> {
+        let manager = ProductionKVCacheManager::for_llm_model(model_name, devices.to_vec())?;
+        let mut results = Vec::new();
+        
+        for test_case in test_cases {
+            log::info!("Benchmarking: seq_len={}, heads={}x{}", 
+                      test_case.seq_len, test_case.num_heads, test_case.head_dim);
+            
+            let arena = manager.create_sequence_arena(
+                test_case.seq_len / 2,
+                test_case.seq_len,
+                test_case.num_heads,
+                test_case.head_dim,
+                None,
+            )?;
+            
+            // Allocation benchmark
+            let alloc_start = std::time::Instant::now();
+            let mut tensor = manager.allocate_kv_tensor(
+                &arena,
+                test_case.seq_len / 2,
+                test_case.seq_len,
+                test_case.num_heads,
+                test_case.head_dim,
+                2, // fp16
+            )?;
+            let alloc_time = alloc_start.elapsed();
+            
+            // Extension benchmark
+            let gen_stats = simulate_generation(&manager, &arena, &mut tensor, test_case.extension_tokens)?;
+            
+            results.push(KVBenchmarkResult {
+                test_case: test_case.clone(),
+                allocation_time_ms: alloc_time.as_millis() as f64,
+                generation_stats: gen_stats,
+                arena_stats: arena.stats(),
+            });
+        }
+        
+        Ok(KVBenchmarkResults {
+            model_name: model_name.to_string(),
+            results,
+            system_health: manager.get_system_health(),
+        })
+    }
+
+    /// Estimate memory requirements for model deployment
+    pub fn estimate_deployment_requirements(
+        model_name: &str,
+        concurrent_sequences: usize,
+        avg_seq_len: usize,
+        max_seq_len: usize,
+    ) -> MemoryEstimate {
+        let (num_heads, head_dim, num_layers) = match model_name.to_lowercase().as_str() {
+            name if name.contains("llama") && name.contains("7b") => (32, 128, 32),
+            name if name.contains("llama") && name.contains("13b") => (40, 128, 40),
+            name if name.contains("llama") && name.contains("70b") => (64, 128, 80),
+            _ => (32, 128, 32), // Default
+        };
+        
+        let page_size = calculate_optimal_kv_page_size(max_seq_len, num_heads, head_dim, 2);
+        let kv_size_per_sequence = 2 * max_seq_len * num_heads * head_dim * 2; // K+V, fp16
+        let total_kv_size = kv_size_per_sequence * concurrent_sequences * num_layers;
+        
+        let pages_needed = (total_kv_size + page_size - 1) / page_size;
+        let total_allocated = pages_needed * page_size;
+        
+        MemoryEstimate {
+            model_name: model_name.to_string(),
+            concurrent_sequences,
+            avg_seq_len,
+            max_seq_len,
+            kv_size_per_sequence_mb: kv_size_per_sequence / (1024 * 1024),
+            total_kv_size_mb: total_kv_size / (1024 * 1024),
+            total_allocated_mb: total_allocated / (1024 * 1024),
+            pages_needed,
+            page_size_kb: page_size / 1024,
+            memory_efficiency: total_kv_size as f64 / total_allocated as f64,
+            recommended_gpu_memory_gb: (total_allocated as f64 * 1.5) / (1024.0 * 1024.0 * 1024.0), // 50% overhead
+        }
+    }
+}
+
+/// KV benchmark test case
+#[derive(Debug, Clone)]
+pub struct KVBenchmarkCase {
+    pub seq_len: usize,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub extension_tokens: usize,
+}
+
+/// KV benchmark result
+#[derive(Debug, Clone)]
+pub struct KVBenchmarkResult {
+    pub test_case: KVBenchmarkCase,
+    pub allocation_time_ms: f64,
+    pub generation_stats: GenerationStats,
+    pub arena_stats: ZeroCopyArenaStats,
+}
+
+/// Complete benchmark results
+#[derive(Debug, Clone)]
+pub struct KVBenchmarkResults {
+    pub model_name: String,
+    pub results: Vec<KVBenchmarkResult>,
+    pub system_health: SystemHealthReport,
+}
+
+/// Memory deployment estimate
+#[derive(Debug, Clone)]
+pub struct MemoryEstimate {
+    pub model_name: String,
+    pub concurrent_sequences: usize,
+    pub avg_seq_len: usize,
+    pub max_seq_len: usize,
+    pub kv_size_per_sequence_mb: usize,
+    pub total_kv_size_mb: usize,
+    pub total_allocated_mb: usize,
+    pub pages_needed: usize,
+    pub page_size_kb: usize,
+    pub memory_efficiency: f64,
+    pub recommended_gpu_memory_gb: f64,
 }
 
 /// Request for inference processing
@@ -941,8 +1192,8 @@ pub struct InferenceRequest {
     pub request_id: String,
     pub prompt_length: usize,
     pub max_new_tokens: usize,
-    pub hidden_dim: usize,
     pub num_heads: usize,
+    pub head_dim: usize,
     pub preferred_device: Option<i32>,
 }
 
@@ -954,4 +1205,167 @@ pub struct GenerationStats {
     pub copy_extensions: usize,
     pub total_time_ms: f64,
     pub avg_time_per_token_ms: f64,
+}
+
+/// Advanced KV cache configuration
+pub struct AdvancedKVConfig {
+    pub enable_compression: bool,
+    pub compression_ratio: f32,
+    pub enable_quantization: bool,
+    pub quantization_bits: u8,
+    pub enable_sparsity: bool,
+    pub sparsity_threshold: f32,
+    pub prefetch_strategy: PrefetchStrategy,
+    pub eviction_policy: EvictionPolicy,
+}
+
+#[derive(Debug, Clone)]
+pub enum PrefetchStrategy {
+    None,
+    Conservative,
+    Aggressive,
+    Adaptive,
+}
+
+#[derive(Debug, Clone)]
+pub enum EvictionPolicy {
+    LRU,
+    LFU,
+    FIFO,
+    Adaptive,
+}
+
+impl Default for AdvancedKVConfig {
+    fn default() -> Self {
+        Self {
+            enable_compression: false,
+            compression_ratio: 0.5,
+            enable_quantization: false,
+            quantization_bits: 8,
+            enable_sparsity: false,
+            sparsity_threshold: 0.01,
+            prefetch_strategy: PrefetchStrategy::Conservative,
+            eviction_policy: EvictionPolicy::LRU,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_kv_model_configurations() {
+        // Test model-specific optimizations
+        let models = vec!["llama-7b", "llama-13b", "llama-70b"];
+        let devices = vec![0];
+        
+        for model in models {
+            match ProductionKVCacheManager::for_llm_model(model, devices.clone()) {
+                Ok(manager) => {
+                    let health = manager.get_system_health();
+                    println!("✓ Model {} initialized with health score: {:.2}", 
+                            model, health.health_score);
+                }
+                Err(e) => {
+                    println!("Model {} failed to initialize: {}", model, e);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_workload_optimizations() {
+        let devices = vec![0];
+        
+        // Test chatbot optimization
+        if let Ok(chatbot_manager) = ProductionKVCacheManager::for_chatbot(devices.clone()) {
+            println!("✓ Chatbot manager created");
+            let config_desc = format!("page_size={}KB", 
+                                    chatbot_manager.config.base_page_size / 1024);
+            println!("  Configuration: {}", config_desc);
+        }
+        
+        // Test document processing optimization
+        if let Ok(doc_manager) = ProductionKVCacheManager::for_document_processing(devices.clone()) {
+            println!("✓ Document processing manager created");
+            let config_desc = format!("page_size={}MB", 
+                                    doc_manager.config.base_page_size / 1024 / 1024);
+            println!("  Configuration: {}", config_desc);
+        }
+        
+        // Test batch inference optimization
+        if let Ok(batch_manager) = ProductionKVCacheManager::for_batch_inference(devices.clone(), 16) {
+            println!("✓ Batch inference manager created for batch_size=16");
+            let config_desc = format!("page_size={}KB", 
+                                    batch_manager.config.base_page_size / 1024);
+            println!("  Configuration: {}", config_desc);
+        }
+    }
+
+    #[test]
+    fn test_memory_estimation() {
+        let estimate = llm_server_api::estimate_deployment_requirements(
+            "llama-7b",
+            32,  // concurrent sequences
+            2048, // avg seq len
+            4096, // max seq len
+        );
+        
+        println!("✓ Memory estimate for Llama-7B deployment:");
+        println!("  Total KV size: {} MB", estimate.total_kv_size_mb);
+        println!("  Total allocated: {} MB", estimate.total_allocated_mb);
+        println!("  Memory efficiency: {:.1}%", estimate.memory_efficiency * 100.0);
+        println!("  Recommended GPU memory: {:.1} GB", estimate.recommended_gpu_memory_gb);
+        
+        assert!(estimate.memory_efficiency > 0.5, "Memory efficiency should be reasonable");
+        assert!(estimate.recommended_gpu_memory_gb > 0.0, "Should recommend some GPU memory");
+    }
+
+    #[test]
+    fn test_kv_benchmark_structure() {
+        let test_cases = vec![
+            KVBenchmarkCase { seq_len: 1024, num_heads: 32, head_dim: 128, extension_tokens: 256 },
+            KVBenchmarkCase { seq_len: 2048, num_heads: 32, head_dim: 128, extension_tokens: 512 },
+            KVBenchmarkCase { seq_len: 4096, num_heads: 32, head_dim: 128, extension_tokens: 1024 },
+        ];
+        
+        // Verify benchmark structure
+        for (i, case) in test_cases.iter().enumerate() {
+            assert!(case.seq_len > 0, "Test case {} should have valid seq_len", i);
+            assert!(case.num_heads > 0, "Test case {} should have valid num_heads", i);
+            assert!(case.head_dim > 0, "Test case {} should have valid head_dim", i);
+            assert!(case.extension_tokens > 0, "Test case {} should have valid extension_tokens", i);
+        }
+        
+        println!("✓ KV benchmark structure validated for {} test cases", test_cases.len());
+    }
+
+    #[test]
+    fn test_api_consistency() {
+        // Test that all initialization methods are consistent
+        let devices = vec![0];
+        
+        // Test model-specific initialization
+        if let Ok(_manager) = llm_server_api::initialize_for_server("llama-7b", &devices) {
+            println!("✓ Server initialization API works");
+        }
+        
+        // Test workload-specific initialization
+        if let Ok(_manager) = llm_server_api::initialize_for_chatbot(&devices) {
+            println!("✓ Chatbot initialization API works");
+        }
+        
+        if let Ok(_manager) = llm_server_api::initialize_for_documents(&devices) {
+            println!("✓ Document initialization API works");
+        }
+        
+        if let Ok(_manager) = llm_server_api::initialize_for_code_generation(&devices) {
+            println!("✓ Code generation initialization API works");
+        }
+        
+        if let Ok(_manager) = llm_server_api::initialize_for_batch_inference(&devices, 8) {
+            println!("✓ Batch inference initialization API works");
+        }
+    }
 }

@@ -498,15 +498,24 @@ pub extern "C" fn prod_batch_allocate_sequences(
     let manager_ref = unsafe { &(*manager).0 };
     let request_slice = unsafe { std::slice::from_raw_parts(requests, num_requests) };
 
-    // Convert C requests to Rust requests
+    // Convert C requests to Rust requests with proper field mapping
     let sequence_requests: Vec<SequenceRequest> = request_slice.iter()
-        .map(|req| SequenceRequest {
-            initial_seq_len: req.initial_seq_len,
-            max_seq_len: req.max_seq_len,
-            hidden_dim: req.hidden_dim,
-            num_heads: req.num_heads,
-            dtype_size: req.dtype_size,
-            preferred_device: if req.preferred_device < 0 { None } else { Some(req.preferred_device) },
+        .map(|req| {
+            // Calculate head_dim from hidden_dim and num_heads
+            let head_dim = if req.num_heads > 0 {
+                req.hidden_dim / req.num_heads
+            } else {
+                128 // Default head_dim if num_heads is 0
+            };
+            
+            SequenceRequest {
+                initial_seq_len: req.initial_seq_len,
+                max_seq_len: req.max_seq_len,
+                num_heads: req.num_heads,
+                head_dim, // Use calculated head_dim
+                dtype_size: req.dtype_size,
+                preferred_device: if req.preferred_device < 0 { None } else { Some(req.preferred_device) },
+            }
         })
         .collect();
 

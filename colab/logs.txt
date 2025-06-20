@@ -1,0 +1,16 @@
+INFO:arena_kv_cache_bindings:CUDA available with 1 device(s)
+INFO:arena_kv_cache_bindings:Successfully loaded library: ./libarena_kv_cache.so
+INFO:arena_kv_cache_bindings:All function signatures configured successfully
+✅ Successfully imported enhanced arena bindings
+🧪 ARENA KV-CACHE TEST SUITE
+==================================================
+Device: cuda:0
+CUDA Available: True
+CUDA Device: Tesla T4
+CUDA Memory: 14.7 GB
+
+
+🔍 Running: Basic Allocation & Tensor Creation
+------------------------------
+🔧 Testing basic allocation...
+INFO:arena_kv_cache_bindings:Optimized page size: 1536KB for model config: {'hidden_size': 512, 'num_heads': 8, 'typical_seq_len': 128}

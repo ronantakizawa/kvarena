@@ -2,6 +2,7 @@
 name = "arena_kv_cache"
 version = "1.0.0"
 edition = "2021"
+build = "build.rs"
 
 [lib]
 name = "arena_kv_cache"
@@ -12,22 +13,36 @@ crossbeam = "0.8"
 log = "0.4"
 lazy_static = "1.4"
 
-[features]
-default = []
-python = ["pyo3"]
-cuda = ["cudarc"]
-examples = []
+# Real CUDA runtime bindings
+cuda-runtime-sys = { version = "0.3.0-alpha.1", optional = true }
+cudarc = { version = "0.10", optional = true }
 
 [dependencies.pyo3]
 version = "0.20"
 features = ["extension-module"]
 optional = true
 
-[dependencies.cudarc]
-version = "0.10"
-optional = true
+[build-dependencies]
+cc = "1.0"
+bindgen = "0.68"
+pkg-config = "0.3"
+
+[features]
+default = ["cuda"]
+python = ["pyo3"]
+cuda = ["cuda-runtime-sys", "cudarc"]
+examples = []
+
+# CUDA-specific build configuration
+[target.'cfg(target_os = "linux")'.dependencies]
+cuda-runtime-sys = { version = "0.3.0-alpha.1", optional = true }
 
 [profile.release]
 lto = true
 codegen-units = 1
 panic = "abort"
+opt-level = 3
+
+# CUDA linking configuration
+[target.'cfg(all(target_os = "linux", feature = "cuda"))']
+rustflags = ["-L", "/usr/local/cuda/lib64", "-l", "cudart"]
