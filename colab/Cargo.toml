@@ -9,6 +9,7 @@ repository = "https://github.com/yourusername/arena_kv_cache"
 readme = "README.md"
 keywords = ["cuda", "gpu", "memory", "arena", "kv-cache"]
 categories = ["memory-management", "gpu"]
+build = "build.rs"
 
 [lib]
 name = "arena_kv_cache"
@@ -31,12 +32,12 @@ pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
 [build-dependencies]
 cc = "1.0"
 
-# CUDA linking configuration
+# CUDA-specific system dependencies (Linux)
 [target.'cfg(target_os = "linux")'.dependencies]
 
 [target.'cfg(target_os = "windows")'.dependencies]
 
-# Build configuration for CUDA
+# Build configuration
 [package.metadata.docs.rs]
 features = ["cuda"]
 rustdoc-args = ["--cfg", "docsrs"]
@@ -52,3 +53,14 @@ panic = "abort"
 opt-level = 1
 debug = true
 overflow-checks = true
+
+# CUDA linking hints for different platforms
+[package.metadata.cuda]
+min_version = "11.0"
+preferred_version = "12.0"
+required_compute_capabilities = ["7.5"]  # T4 GPU requirement
+
+[[bin]]
+name = "test_cuda_integration"
+path = "src/bin/test_cuda_integration.rs"
+required-features = ["cuda"]
