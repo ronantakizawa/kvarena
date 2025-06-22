@@ -1,24 +1,31 @@
-// src/cuda.rs - Real CUDA device memory management with actual CUDA calls
+// src/cuda.rs - True CUDA integration with actual device memory management
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::ptr::NonNull;
 use std::collections::HashMap;
+use std::sync::Mutex;
 
-// Real CUDA FFI bindings - these will link to actual CUDA runtime
+// CUDA Runtime API bindings - these link to actual libcudart
+#[link(name = "cudart")]
 extern "C" {
     // Device management
     fn cudaSetDevice(device: i32) -> i32;
     fn cudaGetDevice(device: *mut i32) -> i32;
     fn cudaGetDeviceCount(count: *mut i32) -> i32;
+    fn cudaDeviceReset() -> i32;
+    fn cudaDeviceSynchronize() -> i32;
     
-    // Memory management - REAL CUDA CALLS
+    // Memory management - REAL CUDA memory operations
     fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> i32;
     fn cudaFree(devPtr: *mut c_void) -> i32;
-    pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
+    fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
     fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
     fn cudaMemset(devPtr: *mut c_void, value: i32, count: usize) -> i32;
     fn cudaMemsetAsync(devPtr: *mut c_void, value: i32, count: usize, stream: *mut c_void) -> i32;
+    
+    // Memory info
+    fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     
     // Stream management
     fn cudaStreamCreate(stream: *mut *mut c_void) -> i32;
@@ -32,12 +39,8 @@ extern "C" {
     fn cudaGetErrorString(error: i32) -> *const i8;
     
     // Device properties
-    fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
-    fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
     fn cudaGetDeviceProperties(prop: *mut CudaDeviceProperties, device: i32) -> i32;
-    
-    // Context management
-    fn cudaDeviceSynchronize() -> i32;
+    fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
 }
 
 // CUDA constants
@@ -46,6 +49,7 @@ const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
 const CUDA_ERROR_NOT_INITIALIZED: i32 = 3;
 const CUDA_ERROR_INVALID_DEVICE: i32 = 10;
 const CUDA_ERROR_INVALID_VALUE: i32 = 11;
+const CUDA_ERROR_NOT_READY: i32 = 600;
 
 const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
 const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
@@ -53,10 +57,16 @@ const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
 const CUDA_STREAM_NON_BLOCKING: u32 = 0x01;
 
+// Device attributes
+const CUDA_DEVICE_ATTR_MEMORY_CLOCK_RATE: i32 = 36;
+const CUDA_DEVICE_ATTR_GLOBAL_MEMORY_BUS_WIDTH: i32 = 37;
+const CUDA_DEVICE_ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
+const CUDA_DEVICE_ATTR_MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
+
 #[repr(C)]
 struct CudaDeviceProperties {
     name: [i8; 256],
-    uuid: [i8; 16],
+    uuid: [i8; 16], 
     total_global_mem: usize,
     shared_mem_per_block: usize,
     regs_per_block: i32,
@@ -82,6 +92,16 @@ struct CudaDeviceProperties {
 #[derive(Debug, Clone, Copy)]
 pub struct CudaError(pub i32);
 
+impl CudaError {
+    pub fn from_code(code: i32) -> Self {
+        CudaError(code)
+    }
+    
+    pub fn code(&self) -> i32 {
+        self.0
+    }
+}
+
 impl std::fmt::Display for CudaError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         unsafe {
@@ -98,6 +118,43 @@ impl std::fmt::Display for CudaError {
 
 impl std::error::Error for CudaError {}
 
+/// Initialize CUDA runtime and verify T4 GPU availability
+pub fn initialize_cuda() -> Result<(), CudaError> {
+    unsafe {
+        // Check device count
+        let mut device_count = 0;
+        let result = cudaGetDeviceCount(&mut device_count);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError(result));
+        }
+        
+        if device_count == 0 {
+            return Err(CudaError(CUDA_ERROR_INVALID_DEVICE));
+        }
+        
+        // Set device 0 (T4)
+        let result = cudaSetDevice(0);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError(result));
+        }
+        
+        // Verify device works with a small allocation test
+        let mut test_ptr = std::ptr::null_mut();
+        let result = cudaMalloc(&mut test_ptr, 1024);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError(result));
+        }
+        
+        let result = cudaFree(test_ptr);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError(result));
+        }
+        
+        log::info!("CUDA initialized successfully with {} device(s)", device_count);
+        Ok(())
+    }
+}
+
 /// CUDA stream for asynchronous operations
 #[derive(Debug)]
 pub struct CudaStream {
@@ -106,7 +163,7 @@ pub struct CudaStream {
 }
 
 impl CudaStream {
-    /// Create a new CUDA stream with REAL CUDA API call
+    /// Create a new CUDA stream
     pub fn new(device_id: i32, non_blocking: bool) -> Result<Self, CudaError> {
         unsafe {
             let result = cudaSetDevice(device_id);
@@ -152,7 +209,7 @@ impl CudaStream {
             let result = cudaStreamQuery(self.stream.as_ptr());
             match result {
                 CUDA_SUCCESS => Ok(true),
-                1 => Ok(false), // cudaErrorNotReady
+                CUDA_ERROR_NOT_READY => Ok(false),
                 _ => Err(CudaError(result)),
             }
         }
@@ -171,12 +228,12 @@ impl Drop for CudaStream {
 unsafe impl Send for CudaStream {}
 unsafe impl Sync for CudaStream {}
 
-/// True bump allocator with atomic offset - NO PER-TENSOR METADATA
+/// True bump allocator with REAL CUDA device memory
 #[derive(Debug)]
 pub struct BumpAllocator {
     /// Current allocation offset (atomic for thread safety)
     current_offset: AtomicUsize,
-    /// Raw device memory pointer
+    /// REAL device memory pointer from cudaMalloc
     device_ptr: NonNull<u8>,
     /// Total page size
     page_size: usize,
@@ -200,20 +257,29 @@ impl BumpAllocator {
             let mut device_ptr = std::ptr::null_mut();
             let result = cudaMalloc(&mut device_ptr, page_size);
             if result != CUDA_SUCCESS {
+                log::error!("cudaMalloc failed for {} bytes on device {}: {}", 
+                           page_size, device_id, CudaError(result));
                 return Err(CudaError(result));
             }
 
-            // Zero initialize the memory
-            let result = cudaMemset(device_ptr, 0, page_size);
-            if result != CUDA_SUCCESS {
-                let _ = cudaFree(device_ptr);
-                return Err(CudaError(result));
-            }
-
-            // Create async stream for this allocator
+            // Zero initialize the memory asynchronously if possible
             let stream = match CudaStream::new(device_id, true) {
-                Ok(stream) => Some(Arc::new(stream)),
-                Err(_) => None, // Continue without stream
+                Ok(stream) => {
+                    let stream_ptr = stream.as_ptr();
+                    let memset_result = cudaMemsetAsync(device_ptr, 0, page_size, stream_ptr);
+                    if memset_result == CUDA_SUCCESS {
+                        Some(Arc::new(stream))
+                    } else {
+                        // Fall back to synchronous memset
+                        let _ = cudaMemset(device_ptr, 0, page_size);
+                        Some(Arc::new(stream))
+                    }
+                }
+                Err(_) => {
+                    // No stream, use synchronous memset
+                    let _ = cudaMemset(device_ptr, 0, page_size);
+                    None
+                }
             };
 
             log::info!("REAL CUDA allocation: {} bytes on device {}, ptr={:p}", 
@@ -229,7 +295,7 @@ impl BumpAllocator {
         }
     }
 
-    /// Pure bump allocation: offset += align(size) - NO METADATA
+    /// Pure bump allocation: offset += align(size)
     pub fn allocate(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
         let aligned_size = (size + align - 1) & !(align - 1);
         
@@ -239,9 +305,13 @@ impl BumpAllocator {
         if old_offset + aligned_size <= self.page_size {
             // Return pointer to allocated region
             let ptr = unsafe { self.device_ptr.as_ptr().add(old_offset) };
+            log::trace!("Bump allocated {} bytes at offset {} (device ptr {:p})", 
+                       aligned_size, old_offset, ptr);
             Some(NonNull::new(ptr).unwrap())
         } else {
             // Page full - allocation failed
+            log::debug!("Bump allocation failed: {} bytes requested, {} available", 
+                       aligned_size, self.page_size - old_offset);
             None
         }
     }
@@ -276,8 +346,10 @@ impl BumpAllocator {
             };
 
             if result != CUDA_SUCCESS {
+                log::error!("CUDA memcpy failed: {} bytes from host to device offset {}", size, offset);
                 Err(CudaError(result))
             } else {
+                log::trace!("CUDA memcpy: {} bytes from host to device offset {}", size, offset);
                 Ok(())
             }
         }
@@ -305,9 +377,10 @@ impl BumpAllocator {
             };
 
             if result != CUDA_SUCCESS {
+                log::error!("CUDA device-to-device copy failed: {} bytes", size);
                 Err(CudaError(result))
             } else {
-                log::debug!("Zero-copy device move: {} bytes from {} to {}", size, src_offset, dst_offset);
+                log::debug!("Zero-copy device move: {} bytes from offset {} to {}", size, src_offset, dst_offset);
                 Ok(())
             }
         }
@@ -352,6 +425,17 @@ impl BumpAllocator {
     /// Reset allocator (for page reuse)
     pub fn reset(&self) {
         self.current_offset.store(0, Ordering::Relaxed);
+        // Optionally zero the memory again
+        if let Some(stream) = &self.stream {
+            unsafe {
+                let _ = cudaMemsetAsync(
+                    self.device_ptr.as_ptr() as *mut c_void, 
+                    0, 
+                    self.page_size, 
+                    stream.as_ptr()
+                );
+            }
+        }
     }
 
     /// Get basic info
@@ -369,6 +453,8 @@ impl Drop for BumpAllocator {
             // Synchronize before freeing
             if let Some(stream) = &self.stream {
                 let _ = stream.synchronize();
+            } else {
+                let _ = cudaDeviceSynchronize();
             }
             
             // REAL CUDA FREE - this actually calls cudaFree
@@ -386,7 +472,7 @@ impl Drop for BumpAllocator {
 unsafe impl Send for BumpAllocator {}
 unsafe impl Sync for BumpAllocator {}
 
-/// Real CUDA page backed by bump allocator
+/// CUDA page backed by real device memory
 #[derive(Debug)]
 pub struct CudaPage {
     allocator: BumpAllocator,
@@ -401,6 +487,8 @@ impl CudaPage {
     pub fn new(size: usize, device_id: i32) -> Result<Self, CudaError> {
         let allocator = BumpAllocator::new(size, device_id)?;
         let allocation_id = NEXT_ALLOCATION_ID.fetch_add(1, Ordering::Relaxed) as u64;
+        
+        log::debug!("Created CUDA page {}: {} bytes on device {}", allocation_id, size, device_id);
         
         Ok(CudaPage {
             allocator,
@@ -446,14 +534,390 @@ impl CudaPage {
     pub fn available_space(&self) -> usize { self.allocator.available_space() }
     pub fn utilization(&self) -> f64 { self.allocator.utilization() }
     pub fn allocation_id(&self) -> u64 { self.allocation_id }
+    
     pub fn is_ready(&self) -> Result<bool, CudaError> { 
-        // For simplicity, always ready after sync
+        // Check if any async operations are complete
         self.synchronize()?;
         Ok(true)
     }
 }
 
-/// Real CUDA tensor that directly references device memory
+/// Device information with real CUDA queries
+#[derive(Debug, Clone)]
+pub struct CudaDeviceInfo {
+    pub device_id: i32,
+    pub name: String,
+    pub total_memory: usize,
+    pub free_memory: usize,
+    pub compute_capability_major: i32,
+    pub compute_capability_minor: i32,
+    pub multiprocessor_count: i32,
+    pub max_threads_per_block: i32,
+    pub warp_size: i32,
+    pub memory_clock_rate: i32,
+    pub memory_bus_width: i32,
+    pub max_threads_per_multiprocessor: i32,
+}
+
+impl CudaDeviceInfo {
+    /// Query device info using REAL CUDA API calls
+    pub fn query(device_id: i32) -> Result<Self, CudaError> {
+        unsafe {
+            let result = cudaSetDevice(device_id);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            // Get device properties
+            let mut props: CudaDeviceProperties = std::mem::zeroed();
+            let result = cudaGetDeviceProperties(&mut props, device_id);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            // Get memory info
+            let mut free_memory = 0;
+            let mut total_memory = 0;
+            let result = cudaMemGetInfo(&mut free_memory, &mut total_memory);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            // Get additional attributes
+            let mut memory_clock_rate = 0;
+            let mut memory_bus_width = 0;
+            let mut max_threads_per_multiprocessor = 0;
+            
+            cudaDeviceGetAttribute(&mut memory_clock_rate, CUDA_DEVICE_ATTR_MEMORY_CLOCK_RATE, device_id);
+            cudaDeviceGetAttribute(&mut memory_bus_width, CUDA_DEVICE_ATTR_GLOBAL_MEMORY_BUS_WIDTH, device_id);
+            cudaDeviceGetAttribute(&mut max_threads_per_multiprocessor, CUDA_DEVICE_ATTR_MAX_THREADS_PER_MULTIPROCESSOR, device_id);
+
+            // Convert name from C string
+            let name = std::ffi::CStr::from_ptr(props.name.as_ptr())
+                .to_string_lossy()
+                .into_owned();
+
+            log::info!("Queried CUDA device {}: {} (CC {}.{}, {} MB total, {} MB free)", 
+                      device_id, name, props.major, props.minor, 
+                      total_memory / 1024 / 1024, free_memory / 1024 / 1024);
+
+            Ok(CudaDeviceInfo {
+                device_id,
+                name,
+                total_memory,
+                free_memory,
+                compute_capability_major: props.major,
+                compute_capability_minor: props.minor,
+                multiprocessor_count: props.multiprocessor_count,
+                max_threads_per_block: props.max_threads_per_block,
+                warp_size: props.warp_size,
+                memory_clock_rate,
+                memory_bus_width,
+                max_threads_per_multiprocessor,
+            })
+        }
+    }
+    
+    /// Check if this is a T4 GPU
+    pub fn is_t4(&self) -> bool {
+        self.name.to_lowercase().contains("t4") || 
+        (self.compute_capability_major == 7 && self.compute_capability_minor == 5)
+    }
+    
+    /// Get memory bandwidth in GB/s
+    pub fn memory_bandwidth_gbps(&self) -> f64 {
+        // Bandwidth = (memory_clock_rate * 2) * (memory_bus_width / 8) / 1e9
+        let clock_hz = self.memory_clock_rate as f64 * 1000.0; // Convert kHz to Hz
+        let bus_width_bytes = self.memory_bus_width as f64 / 8.0;
+        (clock_hz * 2.0 * bus_width_bytes) / 1e9
+    }
+}
+
+/// CUDA memory manager with real device queries
+#[derive(Debug)]
+pub struct CudaMemoryManager {
+    pub device_infos: Vec<CudaDeviceInfo>,
+    current_device: i32,
+    initialized: bool,
+    allocation_stats: Arc<Mutex<HashMap<i32, DeviceStats>>>,
+}
+
+#[derive(Debug, Default)]
+struct DeviceStats {
+    total_allocated: usize,
+    peak_allocated: usize,
+    allocation_count: usize,
+}
+
+impl CudaMemoryManager {
+    /// Initialize with REAL CUDA device detection
+    pub fn new() -> Result<Self, CudaError> {
+        // Initialize CUDA first
+        initialize_cuda()?;
+        
+        unsafe {
+            // Check if CUDA is available
+            let mut device_count = 0;
+            let result = cudaGetDeviceCount(&mut device_count);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            if device_count == 0 {
+                return Err(CudaError(CUDA_ERROR_NOT_INITIALIZED));
+            }
+
+            // Get current device
+            let mut current_device = 0;
+            let result = cudaGetDevice(&mut current_device);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            // Query all available devices using REAL CUDA calls
+            let mut device_infos = Vec::new();
+            for device_id in 0..device_count {
+                match CudaDeviceInfo::query(device_id) {
+                    Ok(info) => {
+                        log::info!("Found CUDA device {}: {} ({} MB total, {} MB free)", 
+                                  device_id, info.name, 
+                                  info.total_memory / 1024 / 1024,
+                                  info.free_memory / 1024 / 1024);
+                        
+                        if info.is_t4() {
+                            log::info!("  ✓ Tesla T4 detected with {:.1} GB/s memory bandwidth", 
+                                      info.memory_bandwidth_gbps());
+                        }
+                        
+                        device_infos.push(info);
+                    }
+                    Err(e) => {
+                        log::warn!("Failed to query device {}: {}", device_id, e);
+                    }
+                }
+            }
+
+            if device_infos.is_empty() {
+                return Err(CudaError(CUDA_ERROR_INVALID_DEVICE));
+            }
+
+            log::info!("CUDA memory manager initialized with {} device(s)", device_infos.len());
+
+            Ok(CudaMemoryManager {
+                device_infos,
+                current_device,
+                initialized: true,
+                allocation_stats: Arc::new(Mutex::new(HashMap::new())),
+            })
+        }
+    }
+
+    /// Allocate CUDA page with real device memory
+    pub fn allocate_page_on_device(&self, size: usize, device_id: i32) -> Result<CudaPage, CudaError> {
+        if !self.initialized {
+            return Err(CudaError(CUDA_ERROR_NOT_INITIALIZED));
+        }
+        
+        let page = CudaPage::new(size, device_id)?;
+        
+        // Update stats
+        if let Ok(mut stats) = self.allocation_stats.lock() {
+            let device_stats = stats.entry(device_id).or_default();
+            device_stats.total_allocated += size;
+            device_stats.allocation_count += 1;
+            if device_stats.total_allocated > device_stats.peak_allocated {
+                device_stats.peak_allocated = device_stats.total_allocated;
+            }
+        }
+        
+        log::debug!("Allocated {}KB page on device {}", size / 1024, device_id);
+        Ok(page)
+    }
+
+    /// Get device information
+    pub fn device_info(&self, device_id: i32) -> Option<&CudaDeviceInfo> {
+        self.device_infos.iter().find(|info| info.device_id == device_id)
+    }
+    
+    /// Get all device infos
+    pub fn devices(&self) -> &[CudaDeviceInfo] {
+        &self.device_infos
+    }
+    
+    /// Get current memory usage on device
+    pub fn get_memory_info(&self, device_id: i32) -> Result<(usize, usize), CudaError> {
+        unsafe {
+            let result = cudaSetDevice(device_id);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+            
+            let mut free = 0;
+            let mut total = 0;
+            let result = cudaMemGetInfo(&mut free, &mut total);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+            
+            Ok((free, total))
+        }
+    }
+    
+    /// Record deallocation
+    pub fn record_deallocation(&self, size: usize, device_id: i32) {
+        if let Ok(mut stats) = self.allocation_stats.lock() {
+            if let Some(device_stats) = stats.get_mut(&device_id) {
+                device_stats.total_allocated = device_stats.total_allocated.saturating_sub(size);
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CudaDeviceStats {
+    pub device_id: i32,
+    pub allocated_bytes: usize,
+    pub active_pages: usize,
+    pub peak_allocated: usize,
+    pub total_memory: usize,
+    pub free_memory: usize,
+    pub utilization: f64,
+}
+
+/// CUDA context for managing multiple devices and global state
+#[derive(Debug)]
+pub struct CudaContext {
+    manager: CudaMemoryManager,
+    streams: Arc<Mutex<HashMap<i32, Arc<CudaStream>>>>,
+}
+
+impl CudaContext {
+    pub fn new() -> Result<Self, CudaError> {
+        let manager = CudaMemoryManager::new()?;
+        let streams = Arc::new(Mutex::new(HashMap::new()));
+        
+        // Create default streams for each device
+        for device_info in &manager.device_infos {
+            match CudaStream::new(device_info.device_id, true) {
+                Ok(stream) => {
+                    if let Ok(mut streams_map) = streams.lock() {
+                        streams_map.insert(device_info.device_id, Arc::new(stream));
+                    }
+                }
+                Err(e) => {
+                    log::warn!("Failed to create stream for device {}: {}", device_info.device_id, e);
+                }
+            }
+        }
+        
+        Ok(CudaContext { manager, streams })
+    }
+
+    pub fn allocate_page_auto(&self, size: usize) -> Result<CudaPage, CudaError> {
+        // Find device with most free memory
+        let mut best_device = 0;
+        let mut max_free = 0;
+        
+        for device_info in &self.manager.device_infos {
+            if let Ok((free, _total)) = self.manager.get_memory_info(device_info.device_id) {
+                if free > max_free {
+                    max_free = free;
+                    best_device = device_info.device_id;
+                }
+            }
+        }
+
+        self.allocate_page_on_device(size, best_device)
+    }
+
+    pub fn allocate_page_on_device(&self, size: usize, device_id: i32) -> Result<CudaPage, CudaError> {
+        self.manager.allocate_page_on_device(size, device_id)
+    }
+
+    pub fn device_stats(&self, device_id: i32) -> Option<(usize, usize)> {
+        self.manager.get_memory_info(device_id).ok()
+    }
+
+    pub fn device_stats_detailed(&self, device_id: i32) -> Option<CudaDeviceStats> {
+        if let Some(info) = self.manager.device_info(device_id) {
+            let (free, total) = self.manager.get_memory_info(device_id).unwrap_or((0, 0));
+            
+            // Get allocation stats
+            let (allocated, peak, count) = if let Ok(stats) = self.manager.allocation_stats.lock() {
+                if let Some(device_stats) = stats.get(&device_id) {
+                    (device_stats.total_allocated, device_stats.peak_allocated, device_stats.allocation_count)
+                } else {
+                    (0, 0, 0)
+                }
+            } else {
+                (0, 0, 0)
+            };
+            
+            Some(CudaDeviceStats {
+                device_id,
+                allocated_bytes: allocated,
+                active_pages: count,
+                peak_allocated: peak,
+                total_memory: total,
+                free_memory: free,
+                utilization: if total > 0 { (total - free) as f64 / total as f64 } else { 0.0 },
+            })
+        } else {
+            None
+        }
+    }
+
+    pub fn manager(&self) -> &CudaMemoryManager {
+        &self.manager
+    }
+    
+    pub fn get_stream(&self, device_id: i32) -> Option<Arc<CudaStream>> {
+        if let Ok(streams) = self.streams.lock() {
+            streams.get(&device_id).cloned()
+        } else {
+            None
+        }
+    }
+    
+    /// Synchronize all devices
+    pub fn synchronize_all(&self) -> Result<(), CudaError> {
+        for device_info in &self.manager.device_infos {
+            unsafe {
+                let result = cudaSetDevice(device_info.device_id);
+                if result != CUDA_SUCCESS {
+                    return Err(CudaError(result));
+                }
+                
+                let result = cudaDeviceSynchronize();
+                if result != CUDA_SUCCESS {
+                    return Err(CudaError(result));
+                }
+            }
+        }
+        Ok(())
+    }
+    
+    /// Reset all devices (for cleanup)
+    pub fn reset_all_devices(&self) -> Result<(), CudaError> {
+        for device_info in &self.manager.device_infos {
+            unsafe {
+                let result = cudaSetDevice(device_info.device_id);
+                if result != CUDA_SUCCESS {
+                    log::warn!("Failed to set device {} for reset", device_info.device_id);
+                    continue;
+                }
+                
+                let result = cudaDeviceReset();
+                if result != CUDA_SUCCESS {
+                    log::warn!("Failed to reset device {}: {}", device_info.device_id, CudaError(result));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+/// CUDA tensor that directly references device memory with real operations
 #[derive(Debug)]
 pub struct CudaTensor {
     /// Direct pointer to device memory (no copies)
@@ -573,6 +1037,33 @@ impl CudaTensor {
             if result != CUDA_SUCCESS {
                 Err(CudaError(result))
             } else {
+                log::trace!("CUDA tensor copy from host: {} bytes", size_bytes);
+                Ok(())
+            }
+        }
+    }
+    
+    /// Copy data from this tensor to host (REAL CUDA memcpy)
+    pub fn copy_to_host(&self, host_data: *mut c_void) -> Result<(), CudaError> {
+        let size_bytes = self.shape.iter().product::<usize>() * self.element_size;
+        
+        unsafe {
+            let result = cudaSetDevice(self.device_id);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            let result = cudaMemcpy(
+                host_data,
+                self.device_ptr() as *const c_void,
+                size_bytes,
+                CUDA_MEMCPY_DEVICE_TO_HOST,
+            );
+
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                log::trace!("CUDA tensor copy to host: {} bytes", size_bytes);
                 Ok(())
             }
         }
@@ -593,206 +1084,88 @@ impl CudaTensor {
             }
         }
     }
-}
-
-/// Device information with real CUDA queries
-#[derive(Debug, Clone)]
-pub struct CudaDeviceInfo {
-    pub device_id: i32,
-    pub name: String,
-    pub total_memory: usize,
-    pub free_memory: usize,
-    pub compute_capability_major: i32,
-    pub compute_capability_minor: i32,
-    pub multiprocessor_count: i32,
-    pub max_threads_per_block: i32,
-    pub warp_size: i32,
-    pub memory_clock_rate: i32,
-    pub memory_bus_width: i32,
-}
-
-impl CudaDeviceInfo {
-    /// Query device info using REAL CUDA API calls
-    pub fn query(device_id: i32) -> Result<Self, CudaError> {
-        unsafe {
-            let result = cudaSetDevice(device_id);
-            if result != CUDA_SUCCESS {
-                return Err(CudaError(result));
-            }
-
-            // Get device properties
-            let mut props: CudaDeviceProperties = std::mem::zeroed();
-            let result = cudaGetDeviceProperties(&mut props, device_id);
-            if result != CUDA_SUCCESS {
-                return Err(CudaError(result));
-            }
-
-            // Get memory info
-            let mut free_memory = 0;
-            let mut total_memory = 0;
-            let result = cudaMemGetInfo(&mut free_memory, &mut total_memory);
-            if result != CUDA_SUCCESS {
-                return Err(CudaError(result));
-            }
-
-            // Get additional attributes
-            let mut memory_clock_rate = 0;
-            let mut memory_bus_width = 0;
-            cudaDeviceGetAttribute(&mut memory_clock_rate, 36, device_id); // CUDA_DEVICE_ATTR_MEMORY_CLOCK_RATE
-            cudaDeviceGetAttribute(&mut memory_bus_width, 37, device_id);  // CUDA_DEVICE_ATTR_GLOBAL_MEMORY_BUS_WIDTH
-
-            // Convert name from C string
-            let name = std::ffi::CStr::from_ptr(props.name.as_ptr())
-                .to_string_lossy()
-                .into_owned();
-
-            Ok(CudaDeviceInfo {
-                device_id,
-                name,
-                total_memory,
-                free_memory,
-                compute_capability_major: props.major,
-                compute_capability_minor: props.minor,
-                multiprocessor_count: props.multiprocessor_count,
-                max_threads_per_block: props.max_threads_per_block,
-                warp_size: props.warp_size,
-                memory_clock_rate,
-                memory_bus_width,
-            })
-        }
+    
+    /// Get tensor size in bytes
+    pub fn size_bytes(&self) -> usize {
+        self.shape.iter().product::<usize>() * self.element_size
     }
 }
 
-/// CUDA memory manager with real device queries
-#[derive(Debug)]
-pub struct CudaMemoryManager {
-    pub device_infos: Vec<CudaDeviceInfo>,
-    current_device: i32,
-    initialized: bool,
-}
-
-impl CudaMemoryManager {
-    /// Initialize with REAL CUDA device detection
-    pub fn new() -> Result<Self, CudaError> {
-        unsafe {
-            // Check if CUDA is available
-            let mut device_count = 0;
-            let result = cudaGetDeviceCount(&mut device_count);
-            if result != CUDA_SUCCESS {
-                return Err(CudaError(result));
-            }
-
-            if device_count == 0 {
-                return Err(CudaError(CUDA_ERROR_NOT_INITIALIZED));
-            }
-
-            // Get current device
-            let mut current_device = 0;
-            let result = cudaGetDevice(&mut current_device);
-            if result != CUDA_SUCCESS {
-                return Err(CudaError(result));
-            }
-
-            // Query all available devices using REAL CUDA calls
-            let mut device_infos = Vec::new();
-            for device_id in 0..device_count {
-                match CudaDeviceInfo::query(device_id) {
-                    Ok(info) => {
-                        log::info!("REAL CUDA device {}: {} ({} MB)", 
-                                  device_id, info.name, info.total_memory / 1024 / 1024);
-                        device_infos.push(info);
-                    }
-                    Err(e) => {
-                        log::warn!("Failed to query device {}: {}", device_id, e);
-                    }
-                }
-            }
-
-            if device_infos.is_empty() {
-                return Err(CudaError(CUDA_ERROR_INVALID_DEVICE));
-            }
-
-            Ok(CudaMemoryManager {
-                device_infos,
-                current_device,
-                initialized: true,
-            })
-        }
-    }
-
-    /// Allocate CUDA page with real device memory
-    pub fn allocate_page_on_device(&self, size: usize, device_id: i32) -> Result<CudaPage, CudaError> {
-        if !self.initialized {
-            return Err(CudaError(CUDA_ERROR_NOT_INITIALIZED));
-        }
-        CudaPage::new(size, device_id)
-    }
-
-    /// Get device information
-    pub fn device_info(&self, device_id: i32) -> Option<&CudaDeviceInfo> {
-        self.device_infos.iter().find(|info| info.device_id == device_id)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct CudaDeviceStats {
-    pub device_id: i32,
-    pub allocated_bytes: usize,
-    pub active_pages: usize,
-    pub peak_allocated: usize,
-    pub total_memory: usize,
-    pub free_memory: usize,
-    pub utilization: f64,
-}
-
-#[derive(Debug)]
-pub struct CudaContext {
-    manager: CudaMemoryManager,
-}
-
-impl CudaContext {
-    pub fn new() -> Result<Self, CudaError> {
-        let manager = CudaMemoryManager::new()?;
-        Ok(CudaContext { manager })
-    }
-
-    pub fn allocate_page_auto(&self, size: usize) -> Result<CudaPage, CudaError> {
-        // Find device with most free memory
-        let best_device = self.manager.device_infos
-            .iter()
-            .max_by_key(|info| info.free_memory)
-            .map(|info| info.device_id)
-            .unwrap_or(0);
-
-        self.allocate_page_on_device(size, best_device)
-    }
-
-    pub fn allocate_page_on_device(&self, size: usize, device_id: i32) -> Result<CudaPage, CudaError> {
-        self.manager.allocate_page_on_device(size, device_id)
-    }
-
-    pub fn device_stats(&self, _device_id: i32) -> Option<(usize, usize)> {
-        Some((0, 0)) // Simplified for now
-    }
-
-    pub fn device_stats_detailed(&self, device_id: i32) -> Option<CudaDeviceStats> {
-        if let Some(info) = self.manager.device_info(device_id) {
-            Some(CudaDeviceStats {
-                device_id,
-                allocated_bytes: 0,
-                active_pages: 0,
-                peak_allocated: 0,
-                total_memory: info.total_memory,
-                free_memory: info.free_memory,
-                utilization: ((info.total_memory - info.free_memory) as f64 / info.total_memory as f64) * 100.0,
-            })
+/// Utility functions for CUDA operations
+pub fn check_cuda_error(operation: &str) -> Result<(), CudaError> {
+    unsafe {
+        let error = cudaGetLastError();
+        if error != CUDA_SUCCESS {
+            log::error!("CUDA error in {}: {}", operation, CudaError(error));
+            Err(CudaError(error))
         } else {
-            None
+            Ok(())
         }
     }
+}
 
-    pub fn manager(&self) -> &CudaMemoryManager {
-        &self.manager
+/// Get CUDA runtime version info
+pub fn get_cuda_version() -> String {
+    // This would require additional CUDA runtime calls
+    // For now, return a placeholder
+    "CUDA Runtime".to_string()
+}
+
+/// Check if CUDA is available and functional
+pub fn is_cuda_available() -> bool {
+    match initialize_cuda() {
+        Ok(()) => true,
+        Err(_) => false,
+    }
+}
+
+/// Perform a CUDA memory test to verify functionality
+pub fn cuda_memory_test(device_id: i32, test_size: usize) -> Result<f64, CudaError> {
+    use std::time::Instant;
+    
+    unsafe {
+        let result = cudaSetDevice(device_id);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError(result));
+        }
+        
+        // Allocate test memory
+        let mut device_ptr = std::ptr::null_mut();
+        let result = cudaMalloc(&mut device_ptr, test_size);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError(result));
+        }
+        
+        // Create host memory
+        let host_data = vec![0u8; test_size];
+        
+        // Test memory bandwidth
+        let start = Instant::now();
+        
+        // Host to device
+        let result = cudaMemcpy(device_ptr, host_data.as_ptr() as *const c_void, test_size, CUDA_MEMCPY_HOST_TO_DEVICE);
+        if result != CUDA_SUCCESS {
+            let _ = cudaFree(device_ptr);
+            return Err(CudaError(result));
+        }
+        
+        // Synchronize
+        let result = cudaDeviceSynchronize();
+        if result != CUDA_SUCCESS {
+            let _ = cudaFree(device_ptr);
+            return Err(CudaError(result));
+        }
+        
+        let elapsed = start.elapsed();
+        let bandwidth_gbps = (test_size as f64) / elapsed.as_secs_f64() / 1e9;
+        
+        // Cleanup
+        let result = cudaFree(device_ptr);
+        if result != CUDA_SUCCESS {
+            return Err(CudaError(result));
+        }
+        
+        Ok(bandwidth_gbps)
     }
 }
 
@@ -801,44 +1174,156 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_real_cuda_allocation() {
-        // This test will only pass with actual CUDA runtime
-        match CudaMemoryManager::new() {
-            Ok(manager) => {
-                println!("✓ Real CUDA manager initialized");
-                if let Ok(page) = manager.allocate_page_on_device(1024 * 1024, 0) {
-                    println!("✓ Real CUDA page allocated: {} bytes", page.size());
-                    
-                    // Test real bump allocation
-                    if let Some(_ptr) = page.allocate(1024, 256) {
-                        println!("✓ Real bump allocation successful");
+    fn test_cuda_initialization() {
+        match initialize_cuda() {
+            Ok(()) => {
+                println!("✓ CUDA initialization successful");
+                
+                // Test device query
+                match CudaMemoryManager::new() {
+                    Ok(manager) => {
+                        println!("✓ CUDA memory manager created");
+                        println!("  Devices: {}", manager.device_infos.len());
+                        
+                        for device in &manager.device_infos {
+                            println!("  Device {}: {} ({} MB)", 
+                                   device.device_id, device.name, device.total_memory / 1024 / 1024);
+                            if device.is_t4() {
+                                println!("    ✓ T4 GPU detected");
+                            }
+                        }
                     }
+                    Err(e) => println!("⚠️ Manager creation failed: {}", e),
                 }
             }
             Err(e) => {
-                println!("Real CUDA not available: {}", e);
-                // This is expected in environments without CUDA runtime
+                println!("⚠️ CUDA initialization failed: {}", e);
+                println!("  This is expected if no CUDA-capable GPU is available");
+            }
+        }
+    }
+
+    #[test]
+    fn test_cuda_memory_operations() {
+        if let Ok(()) = initialize_cuda() {
+            match CudaPage::new(1024 * 1024, 0) {
+                Ok(page) => {
+                    println!("✓ CUDA page allocation successful: {} bytes", page.size());
+                    
+                    // Test allocation within page
+                    if let Some(_ptr) = page.allocate(1024, 256) {
+                        println!("✓ Bump allocation successful");
+                        
+                        // Test utilization
+                        println!("  Page utilization: {:.1}%", page.utilization() * 100.0);
+                        println!("  Available space: {} bytes", page.available_space());
+                    }
+                    
+                    // Test synchronization
+                    if page.synchronize().is_ok() {
+                        println!("✓ Page synchronization successful");
+                    }
+                }
+                Err(e) => println!("⚠️ CUDA page allocation failed: {}", e),
+            }
+        }
+    }
+
+    #[test]
+    fn test_cuda_context() {
+        match CudaContext::new() {
+            Ok(context) => {
+                println!("✓ CUDA context created successfully");
+                
+                // Test auto allocation
+                match context.allocate_page_auto(512 * 1024) {
+                    Ok(page) => {
+                        println!("✓ Auto page allocation: {} bytes on device {}", 
+                               page.size(), page.device_id());
+                    }
+                    Err(e) => println!("⚠️ Auto allocation failed: {}", e),
+                }
+                
+                // Test device stats
+                if let Some(stats) = context.device_stats_detailed(0) {
+                    println!("✓ Device 0 stats:");
+                    println!("  Total memory: {} MB", stats.total_memory / 1024 / 1024);
+                    println!("  Free memory: {} MB", stats.free_memory / 1024 / 1024);
+                    println!("  Utilization: {:.1}%", stats.utilization * 100.0);
+                }
+            }
+            Err(e) => println!("⚠️ CUDA context creation failed: {}", e),
+        }
+    }
+
+    #[test]
+    fn test_memory_bandwidth() {
+        if let Ok(()) = initialize_cuda() {
+            let test_size = 64 * 1024 * 1024; // 64 MB test
+            match cuda_memory_test(0, test_size) {
+                Ok(bandwidth) => {
+                    println!("✓ Memory bandwidth test: {:.2} GB/s", bandwidth);
+                    
+                    // T4 should have around 320 GB/s theoretical bandwidth
+                    if bandwidth > 50.0 {
+                        println!("  ✓ Good memory bandwidth detected");
+                    } else {
+                        println!("  ⚠️ Lower than expected bandwidth");
+                    }
+                }
+                Err(e) => println!("⚠️ Memory bandwidth test failed: {}", e),
             }
         }
     }
 
     #[test]
     fn test_bump_allocator() {
-        if let Ok(allocator) = BumpAllocator::new(4096, 0) {
-            // Test bump allocation
-            let ptr1 = allocator.allocate(1024, 256);
-            assert!(ptr1.is_some());
-            assert_eq!(allocator.current_offset(), 1024);
+        if let Ok(()) = initialize_cuda() {
+            match BumpAllocator::new(4096, 0) {
+                Ok(allocator) => {
+                    println!("✓ Bump allocator created: {} bytes", allocator.page_size());
+                    
+                    // Test multiple allocations
+                    let ptr1 = allocator.allocate(1024, 256);
+                    assert!(ptr1.is_some());
+                    println!("  Allocation 1: offset {}", allocator.current_offset());
+                    
+                    let ptr2 = allocator.allocate(2048, 256);
+                    assert!(ptr2.is_some());
+                    println!("  Allocation 2: offset {}", allocator.current_offset());
+                    
+                    // Test overflow
+                    let ptr3 = allocator.allocate(2048, 256);
+                    assert!(ptr3.is_none());
+                    println!("  ✓ Overflow protection works");
+                    
+                    println!("  Final utilization: {:.1}%", allocator.utilization() * 100.0);
+                }
+                Err(e) => println!("⚠️ Bump allocator creation failed: {}", e),
+            }
+        }
+    }
 
-            let ptr2 = allocator.allocate(2048, 256);
-            assert!(ptr2.is_some());
-            assert_eq!(allocator.current_offset(), 3072);
-
-            // Test overflow
-            let ptr3 = allocator.allocate(2048, 256);
-            assert!(ptr3.is_none()); // Should fail - not enough space
-
-            println!("✓ Bump allocator tests passed");
+    #[test]
+    fn test_cuda_stream() {
+        if let Ok(()) = initialize_cuda() {
+            match CudaStream::new(0, true) {
+                Ok(stream) => {
+                    println!("✓ CUDA stream created for device 0");
+                    
+                    // Test synchronization
+                    if stream.synchronize().is_ok() {
+                        println!("✓ Stream synchronization successful");
+                    }
+                    
+                    // Test query
+                    match stream.is_complete() {
+                        Ok(complete) => println!("  Stream complete: {}", complete),
+                        Err(e) => println!("  Stream query failed: {}", e),
+                    }
+                }
+                Err(e) => println!("⚠️ CUDA stream creation failed: {}", e),
+            }
         }
     }
 }

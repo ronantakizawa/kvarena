@@ -1,48 +1,54 @@
 [package]
 name = "arena_kv_cache"
-version = "1.0.0"
+version = "0.1.0"
 edition = "2021"
-build = "build.rs"
+authors = ["Your Name <your.email@example.com>"]
+description = "Arena-Allocated KV-Cache with Slab Recycling & Zero-Copy Extensions"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/yourusername/arena_kv_cache"
+readme = "README.md"
+keywords = ["cuda", "gpu", "memory", "arena", "kv-cache"]
+categories = ["memory-management", "gpu"]
 
 [lib]
 name = "arena_kv_cache"
 crate-type = ["cdylib", "rlib"]
 
+[features]
+default = ["cuda"]
+cuda = []
+python-bindings = ["pyo3"]
+
 [dependencies]
-crossbeam = "0.8"
 log = "0.4"
+env_logger = "0.10"
+crossbeam = "0.8"
 lazy_static = "1.4"
 
-# Real CUDA runtime bindings
-cuda-runtime-sys = { version = "0.3.0-alpha.1", optional = true }
-cudarc = { version = "0.10", optional = true }
-
-[dependencies.pyo3]
-version = "0.20"
-features = ["extension-module"]
-optional = true
+# Optional dependencies
+pyo3 = { version = "0.20", features = ["extension-module"], optional = true }
 
 [build-dependencies]
 cc = "1.0"
-bindgen = "0.68"
-pkg-config = "0.3"
 
-[features]
-default = ["cuda"]
-python = ["pyo3"]
-cuda = ["cuda-runtime-sys", "cudarc"]
-examples = []
-
-# CUDA-specific build configuration
+# CUDA linking configuration
 [target.'cfg(target_os = "linux")'.dependencies]
-cuda-runtime-sys = { version = "0.3.0-alpha.1", optional = true }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+
+# Build configuration for CUDA
+[package.metadata.docs.rs]
+features = ["cuda"]
+rustdoc-args = ["--cfg", "docsrs"]
+
+# Profile optimizations for CUDA kernels
 [profile.release]
+opt-level = 3
 lto = true
 codegen-units = 1
 panic = "abort"
-opt-level = 3
 
-# CUDA linking configuration
-[target.'cfg(all(target_os = "linux", feature = "cuda"))']
-rustflags = ["-L", "/usr/local/cuda/lib64", "-l", "cudart"]
+[profile.dev]
+opt-level = 1
+debug = true
+overflow-checks = true
