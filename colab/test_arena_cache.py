@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-Comprehensive test suite for Arena KV-Cache with CUDA support and PyTorch integration.
-Tests memory allocation, tensor creation, CUDA operations, and performance.
+Fixed test suite for Arena KV-Cache with correct parameter usage.
+The key fix: use (seq_len, num_heads, head_dim) instead of (seq_len, hidden_dim, num_heads).
 """
 
 import torch
@@ -105,14 +105,24 @@ class ArenaTestSuite:
             arena = manager.create_sequence_arena()
             print_success("Created sequence arena")
             
-            # Test basic allocation
-            offset, size = arena.allocate_kv_tensor(128, 512, 8, 2)
+            # Test basic allocation with correct parameters
+            # FIXED: Use (seq_len, num_heads, head_dim) instead of (seq_len, hidden_dim, num_heads)
+            seq_len = 128
+            num_heads = 8
+            head_dim = 64  # 512 / 8 = 64
+            dtype_size = 2
+            
+            offset, size = arena.allocate_kv_tensor(seq_len, num_heads, head_dim, dtype_size)
             print_success(f"Allocated tensor: offset={offset}, size={size}")
             
-            # Test PyTorch tensor creation with safer device handling
+            # Test PyTorch tensor creation with FIXED parameters
             try:
                 key_tensor, value_tensor, (new_offset, new_size) = arena.allocate_and_create_tensors(
-                    seq_len=64, hidden_dim=512, num_heads=8, dtype=self.dtype, device='cpu'  # Start with CPU
+                    seq_len=64,
+                    num_heads=8,      # FIXED: Pass num_heads directly
+                    head_dim=64,      # FIXED: Pass head_dim directly (not hidden_dim)
+                    dtype=self.dtype, 
+                    device='cpu'      # Start with CPU for safety
                 )
                 print_success(f"Created PyTorch tensors on CPU: key={key_tensor.shape}, value={value_tensor.shape}")
                 
@@ -133,9 +143,13 @@ class ArenaTestSuite:
                 
             except Exception as tensor_error:
                 print(f"⚠️  PyTorch tensor creation failed, trying CPU-only mode: {tensor_error}")
-                # Fallback to CPU-only
+                # Fallback to CPU-only with correct parameters
                 key_tensor, value_tensor, (new_offset, new_size) = arena.allocate_and_create_tensors(
-                    seq_len=64, hidden_dim=512, num_heads=8, dtype=torch.float32, device='cpu'
+                    seq_len=64,
+                    num_heads=8,      # FIXED: Use num_heads
+                    head_dim=64,      # FIXED: Use head_dim
+                    dtype=torch.float32, 
+                    device='cpu'
                 )
                 print_success(f"Created CPU-only tensors: key={key_tensor.shape}, value={value_tensor.shape}")
             
@@ -179,16 +193,23 @@ class ArenaTestSuite:
             manager = ArenaKVCacheManager(page_size=512*1024)  # Larger pages for GPU
             arena = manager.create_sequence_arena()
             
-            # Test multiple GPU tensors with safer approach
+            # Test multiple GPU tensors with correct parameters
             sequences = [128, 256]  # Reduced complexity for safety
             tensors = []
             
             for seq_len in sequences:
                 try:
+                    # FIXED: Use correct parameter order (seq_len, num_heads, head_dim)
+                    num_heads = 16
+                    head_dim = 64  # 1024 / 16 = 64
+                    
                     # Create on CPU first
                     key, value, (offset, size) = arena.allocate_and_create_tensors(
-                        seq_len=seq_len, hidden_dim=1024, num_heads=16, 
-                        dtype=torch.float16, device='cpu'
+                        seq_len=seq_len, 
+                        num_heads=num_heads,     # FIXED: Pass num_heads
+                        head_dim=head_dim,       # FIXED: Pass head_dim
+                        dtype=torch.float16, 
+                        device='cpu'
                     )
                     
                     # Move to CUDA carefully
@@ -206,10 +227,13 @@ class ArenaTestSuite:
                 
                 except Exception as cuda_error:
                     print(f"⚠️  CUDA tensor creation failed for seq_len={seq_len}: {cuda_error}")
-                    # Fallback to CPU
+                    # Fallback to CPU with correct parameters
                     key, value, (offset, size) = arena.allocate_and_create_tensors(
-                        seq_len=seq_len, hidden_dim=1024, num_heads=16, 
-                        dtype=torch.float32, device='cpu'
+                        seq_len=seq_len, 
+                        num_heads=16,       # FIXED
+                        head_dim=64,        # FIXED  
+                        dtype=torch.float32, 
+                        device='cpu'
                     )
                     key.normal_(0, 1)
                     value.normal_(0, 1)
@@ -271,12 +295,19 @@ class ArenaTestSuite:
             manager = ArenaKVCacheManager()
             arena = manager.create_sequence_arena()
             
-            # Test CPU tensor creation
+            # Test CPU tensor creation with correct parameters
             sequences = [64, 128, 256]
             for seq_len in sequences:
+                # FIXED: Use (seq_len, num_heads, head_dim)
+                num_heads = 8
+                head_dim = 64  # 512 / 8 = 64
+                
                 key, value, (offset, size) = arena.allocate_and_create_tensors(
-                    seq_len=seq_len, hidden_dim=512, num_heads=8,
-                    dtype=torch.float32, device='cpu'
+                    seq_len=seq_len, 
+                    num_heads=num_heads,    # FIXED
+                    head_dim=head_dim,      # FIXED
+                    dtype=torch.float32, 
+                    device='cpu'
                 )
                 
                 # Test operations
@@ -303,11 +334,17 @@ class ArenaTestSuite:
             manager = ArenaKVCacheManager()
             arena = manager.create_sequence_arena()
             
-            # Create initial tensors on CPU for safety
+            # Create initial tensors on CPU for safety with FIXED parameters
             initial_seq_len = 128
+            num_heads = 8
+            head_dim = 64  # 512 / 8 = 64
+            
             key, value, (offset, size) = arena.allocate_and_create_tensors(
-                seq_len=initial_seq_len, hidden_dim=512, num_heads=8,
-                dtype=torch.float32, device='cpu'
+                seq_len=initial_seq_len, 
+                num_heads=num_heads,    # FIXED
+                head_dim=head_dim,      # FIXED
+                dtype=torch.float32, 
+                device='cpu'
             )
             
             # Fill with test data
@@ -335,8 +372,11 @@ class ArenaTestSuite:
                 print(f"⚠️  Extension failed, testing basic properties: {ext_error}")
                 # At least verify we can create tensors of different sizes
                 new_key, new_value, _ = arena.allocate_and_create_tensors(
-                    seq_len=new_seq_len, hidden_dim=512, num_heads=8,
-                    dtype=torch.float32, device='cpu'
+                    seq_len=new_seq_len, 
+                    num_heads=num_heads,    # FIXED
+                    head_dim=head_dim,      # FIXED
+                    dtype=torch.float32, 
+                    device='cpu'
                 )
                 assert new_key.shape[0] == new_seq_len
                 print_success("Basic tensor size variation works")
@@ -358,10 +398,13 @@ class ArenaTestSuite:
                     current_key, current_value = extended_key, extended_value
                     current_size = extended_key.numel() * extended_key.element_size() * 2
                 except:
-                    # Fallback: create new tensor
+                    # Fallback: create new tensor with FIXED parameters
                     current_key, current_value, (current_offset, current_size) = arena.allocate_and_create_tensors(
-                        seq_len=target_seq_len, hidden_dim=512, num_heads=8,
-                        dtype=torch.float32, device='cpu'
+                        seq_len=target_seq_len, 
+                        num_heads=num_heads,    # FIXED
+                        head_dim=head_dim,      # FIXED
+                        dtype=torch.float32, 
+                        device='cpu'
                     )
                     was_zero_copy = False
                 
@@ -391,11 +434,11 @@ class ArenaTestSuite:
             # Test parameters
             num_sequences = 10  # Reduced for stability
             seq_len = 128       # Smaller sequence length
-            hidden_dim = 512    # Smaller hidden dimension  
-            num_heads = 8       # Fewer heads
+            num_heads = 8       # FIXED: Use num_heads instead of hidden_dim
+            head_dim = 64       # FIXED: Use head_dim (512 / 8 = 64)
             num_trials = 3
             
-            print(f"Testing with {num_sequences} sequences, seq_len={seq_len}, hidden_dim={hidden_dim}")
+            print(f"Testing with {num_sequences} sequences, seq_len={seq_len}, heads={num_heads}x{head_dim}")
             
             # Arena allocation benchmark
             arena_times = []
@@ -412,10 +455,11 @@ class ArenaTestSuite:
                 
                 tensors = []
                 for i in range(num_sequences):
+                    # FIXED: Use correct parameters
                     key, value, _ = arena.allocate_and_create_tensors(
                         seq_len=seq_len,
-                        hidden_dim=hidden_dim, 
-                        num_heads=num_heads,
+                        num_heads=num_heads,     # FIXED
+                        head_dim=head_dim,       # FIXED
                         dtype=torch.float32, 
                         device='cpu'  # Use CPU for consistent performance
                     )
@@ -440,8 +484,7 @@ class ArenaTestSuite:
                 
                 tensors = []
                 for i in range(num_sequences):
-                    head_dim = hidden_dim // num_heads
-                    
+                    # Standard PyTorch tensor creation with same shape
                     key = torch.empty(seq_len, num_heads, head_dim, 
                                     dtype=torch.float32, device='cpu')
                     value = torch.empty(seq_len, num_heads, head_dim,
@@ -501,10 +544,14 @@ class ArenaTestSuite:
             for seq_len in moderate_sequences:
                 arena = manager.create_sequence_arena()
                 
+                # FIXED: Use correct parameters
+                num_heads = 16
+                head_dim = 64  # 1024 / 16 = 64
+                
                 key, value, allocation_info = arena.allocate_and_create_tensors(
                     seq_len=seq_len,
-                    hidden_dim=1024,
-                    num_heads=16,
+                    num_heads=num_heads,    # FIXED
+                    head_dim=head_dim,      # FIXED
                     dtype=torch.float32,
                     device='cpu'
                 )
@@ -531,11 +578,17 @@ class ArenaTestSuite:
             for i in range(50):  # Reduced iterations
                 arena = manager.create_sequence_arena()
                 
-                # Small random allocations
+                # Small random allocations with FIXED parameters
                 seq_len = 32 + (i % 64)
+                num_heads = 4
+                head_dim = 64  # 256 / 4 = 64
+                
                 key, value, _ = arena.allocate_and_create_tensors(
-                    seq_len=seq_len, hidden_dim=256, num_heads=4,
-                    dtype=torch.float32, device='cpu'
+                    seq_len=seq_len, 
+                    num_heads=num_heads,    # FIXED
+                    head_dim=head_dim,      # FIXED
+                    dtype=torch.float32, 
+                    device='cpu'
                 )
                 
                 rapid_arenas.append((key, value, arena))

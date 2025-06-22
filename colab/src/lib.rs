@@ -318,7 +318,7 @@ pub extern "C" fn arena_align_size(size: usize) -> usize {
 }
 
 use cuda::{CudaMemoryManager, CudaPage, CudaError, CudaContext};
-use zero_copy::{ZeroCopyManager, ZeroCopyArena, ZeroCopyTensor, ZeroCopyGlobalStats, ZeroCopyArenaStats, GlobalSlabPool, SlabPoolStats};
+use zero_copy::{ZeroCopyArena, ZeroCopyTensor, ZeroCopyGlobalStats, ZeroCopyArenaStats, GlobalSlabPool, SlabPoolStats, ZeroCopyStats, ZeroCopyManager};
 use kv_layout::{ModelConfig, calculate_model_kv_page_size, calculate_optimal_kv_page_size};
 
 // Re-export key types for public API
@@ -456,30 +456,18 @@ impl ProductionMetrics {
 }
 
 impl ProductionKVCacheManager {
-    /// Create new production KV cache manager with REAL zero-copy and slab recycling
+    /// Create new production KV cache manager
     pub fn new(config: LLMServerConfig) -> Result<Self, LLMServerError> {
-        // Initialize CUDA context
+        let slab_pool = Arc::new(GlobalSlabPool::new());
+        let zero_copy_manager = ZeroCopyManager::new(Arc::clone(&slab_pool))?;
+        let slab_manager = SlabPoolManager::new(Arc::clone(&slab_pool));
         let cuda_context = CudaContext::new()?;
         
-        // Create slab pool with REAL recycling
-        let slab_pool = Arc::new(GlobalSlabPool::new());
+        // Start background cleanup
+        slab_manager.start_background_cleanup();
         
-        // Create slab manager for background tasks
-        let slab_manager = SlabPoolManager::new(Arc::clone(&slab_pool));
-        
-        // Create zero-copy manager with REAL zero-copy implementation
-        let zero_copy_manager = ZeroCopyManager::new(Arc::clone(&slab_pool))?;
-        
-        // Start background cleanup if enabled
-        if config.cleanup_interval_seconds > 0 {
-            slab_manager.start_background_cleanup();
-        }
-        
-        let metrics = ProductionMetrics::new();
-        
-        log::info!("Production KV cache manager initialized with REAL zero-copy and slab recycling");
-        log::info!("Devices: {:?}", config.devices);
-        log::info!("Base page size: {} KB (KV-optimized)", config.base_page_size / 1024);
+        log::info!("Production KV cache manager created with page_size={}KB", 
+                  config.base_page_size / 1024);
         
         Ok(Self {
             zero_copy_manager,
@@ -487,14 +475,14 @@ impl ProductionKVCacheManager {
             slab_manager,
             cuda_context,
             config,
-            metrics,
+            metrics: ProductionMetrics::new(),
         })
     }
 
-    /// Create arena optimized for KV tensors with REAL zero-copy
+    /// Create sequence arena for KV tensors
     pub fn create_sequence_arena(
         &self,
-        expected_seq_len: usize,
+        initial_seq_len: usize,
         max_seq_len: usize,
         num_heads: usize,
         head_dim: usize,
@@ -502,36 +490,35 @@ impl ProductionKVCacheManager {
     ) -> Result<Arc<SequenceArena>, LLMServerError> {
         let device = device_id.unwrap_or_else(|| self.select_optimal_device());
         
-        // Calculate optimal page size using KV-specific calculations
-        let page_size = calculate_optimal_kv_page_size(max_seq_len, num_heads, head_dim, 2); // fp16 default
+        // Calculate optimal page size for this KV configuration
+        let page_size = calculate_optimal_kv_page_size(max_seq_len, num_heads, head_dim, 2);
+        let actual_page_size = std::cmp::max(page_size, self.config.base_page_size);
         
-        // Create arena with REAL zero-copy support and slab recycling
-        let arena = self.zero_copy_manager.create_arena(page_size, device)?;
+        let arena = self.zero_copy_manager.create_arena(actual_page_size, device)?;
         
         self.metrics.total_sequences_processed.fetch_add(1, Ordering::Relaxed);
         
-        log::debug!("Created REAL zero-copy sequence arena: device={}, max_seq_len={}, heads={}x{}", 
-                   device, max_seq_len, num_heads, head_dim);
+        log::debug!("Created sequence arena: initial={}, max={}, page_size={}KB, device={}", 
+                   initial_seq_len, max_seq_len, actual_page_size / 1024, device);
         
         Ok(Arc::new(arena))
     }
 
-    /// Allocate KV tensor with REAL zero-copy growth support
+    /// Allocate KV tensor with growth capacity
     pub fn allocate_kv_tensor(
         &self,
         arena: &Arc<SequenceArena>,
         initial_seq_len: usize,
-        expected_max_len: usize,
+        max_seq_len: usize,
         num_heads: usize,
         head_dim: usize,
         dtype_size: usize,
     ) -> Result<KVTensor, LLMServerError> {
         let start_time = std::time::Instant::now();
         
-        // Allocate with growth capacity for TRUE zero-copy extensions
-        let tensor = arena.allocate_tensor_with_growth(
+        let tensor = arena.allocate_kv_tensor_with_growth(
             initial_seq_len,
-            expected_max_len,
+            max_seq_len,
             num_heads,
             head_dim,
             dtype_size,
@@ -540,224 +527,37 @@ impl ProductionKVCacheManager {
         let allocation_time = start_time.elapsed().as_nanos() as usize;
         self.metrics.allocation_time_ns.fetch_add(allocation_time, Ordering::Relaxed);
         
-        log::debug!("Allocated REAL zero-copy KV tensor: {}x{}x{}, growth_capacity={}", 
-                   initial_seq_len, num_heads, head_dim, expected_max_len);
+        log::debug!("Allocated KV tensor: {}->{}KB, {}x{}x{}, {}ns", 
+                   initial_seq_len, max_seq_len, num_heads, head_dim, dtype_size, allocation_time);
         
         Ok(tensor)
     }
 
-    /// Extend KV tensor with TRUE zero-copy (atomic length update only)
+    /// Extend tensor for generation (main API)
     pub fn extend_tensor_for_generation(
         &self,
         arena: &Arc<SequenceArena>,
         tensor: &mut KVTensor,
-        new_tokens: usize,
+        additional_tokens: usize,
     ) -> Result<bool, LLMServerError> {
         let start_time = std::time::Instant::now();
         
-        let current_len = tensor.seq_len(); // Use REAL zero-copy method
-        let new_len = current_len + new_tokens;
-        
-        // Try TRUE zero-copy extension (just atomic update)
-        let was_zero_copy = arena.try_extend_tensor(tensor, new_len)?;
+        let was_zero_copy = arena.extend_tensor_for_generation(tensor, additional_tokens)?;
         
         let extension_time = start_time.elapsed().as_nanos() as usize;
         self.metrics.extension_time_ns.fetch_add(extension_time, Ordering::Relaxed);
-        self.metrics.total_tokens_generated.fetch_add(new_tokens, Ordering::Relaxed);
+        self.metrics.total_tokens_generated.fetch_add(additional_tokens, Ordering::Relaxed);
         
         if was_zero_copy {
             self.metrics.total_zero_copy_extensions.fetch_add(1, Ordering::Relaxed);
-            log::debug!("TRUE zero-copy KV extension: {} -> {} tokens (atomic update only)", 
-                       current_len, new_len);
         } else {
             self.metrics.total_copy_extensions.fetch_add(1, Ordering::Relaxed);
-            log::debug!("Zero-copy extension failed: {} -> {} tokens (exceeded max allocation)", 
-                       current_len, new_len);
         }
+        
+        log::debug!("Extended tensor: +{} tokens, zero_copy={}, {}ns", 
+                   additional_tokens, was_zero_copy, extension_time);
         
         Ok(was_zero_copy)
-    }
-
-    /// Get comprehensive production metrics
-    pub fn get_production_metrics(&self) -> ProductionMetricsReport {
-        let zero_copy_stats = self.zero_copy_manager.global_stats();
-        let slab_stats = self.slab_pool.stats();
-        
-        let total_extensions = self.metrics.total_zero_copy_extensions.load(Ordering::Relaxed) +
-                             self.metrics.total_copy_extensions.load(Ordering::Relaxed);
-        
-        let zero_copy_ratio = if total_extensions > 0 {
-            self.metrics.total_zero_copy_extensions.load(Ordering::Relaxed) as f64 / total_extensions as f64
-        } else {
-            0.0
-        };
-        
-        let avg_allocation_time_ns = if self.metrics.total_sequences_processed.load(Ordering::Relaxed) > 0 {
-            self.metrics.allocation_time_ns.load(Ordering::Relaxed) / 
-            self.metrics.total_sequences_processed.load(Ordering::Relaxed)
-        } else {
-            0
-        };
-        
-        let avg_extension_time_ns = if total_extensions > 0 {
-            self.metrics.extension_time_ns.load(Ordering::Relaxed) / total_extensions
-        } else {
-            0
-        };
-        
-        ProductionMetricsReport {
-            sequences_processed: self.metrics.total_sequences_processed.load(Ordering::Relaxed),
-            tokens_generated: self.metrics.total_tokens_generated.load(Ordering::Relaxed),
-            zero_copy_extensions: self.metrics.total_zero_copy_extensions.load(Ordering::Relaxed),
-            copy_extensions: self.metrics.total_copy_extensions.load(Ordering::Relaxed),
-            zero_copy_ratio,
-            avg_allocation_time_ms: avg_allocation_time_ns as f64 / 1_000_000.0,
-            avg_extension_time_ms: avg_extension_time_ns as f64 / 1_000_000.0,
-            peak_memory_usage_mb: self.metrics.peak_memory_usage.load(Ordering::Relaxed) / 1024 / 1024,
-            zero_copy_stats,
-            slab_stats,
-        }
-    }
-
-    /// Get system health and recommendations
-    pub fn get_system_health(&self) -> SystemHealthReport {
-        let metrics = self.get_production_metrics();
-        let recommendations = self.zero_copy_manager.get_recommendations();
-        let slab_recommendations = self.slab_manager.get_recommendations();
-        
-        // Calculate health score (0.0 = poor, 1.0 = excellent)
-        let mut health_score = 1.0;
-        
-        // Penalize low zero-copy ratio
-        if metrics.zero_copy_ratio < 0.8 {
-            health_score *= 0.8;
-        }
-        
-        // Penalize low slab recycling
-        if metrics.slab_stats.recycling_efficiency < 0.7 {
-            health_score *= 0.9;
-        }
-        
-        // Penalize high memory usage
-        if metrics.zero_copy_stats.memory_pressure() > 0.8 {
-            health_score *= 0.7;
-        }
-        
-        let status = if health_score > 0.9 {
-            SystemStatus::Excellent
-        } else if health_score > 0.7 {
-            SystemStatus::Good
-        } else if health_score > 0.5 {
-            SystemStatus::Warning
-        } else {
-            SystemStatus::Critical
-        };
-        
-        let mut all_recommendations = recommendations;
-        all_recommendations.extend(slab_recommendations);
-        
-        SystemHealthReport {
-            status,
-            health_score,
-            recommendations: all_recommendations,
-            metrics,
-        }
-    }
-
-    /// Force cleanup and optimization (for maintenance)
-    pub fn maintenance_cleanup(&self) -> MaintenanceReport {
-        let start_time = std::time::Instant::now();
-        
-        // Cleanup inactive arenas
-        let inactive_arenas = self.zero_copy_manager.cleanup_inactive_arenas();
-        
-        // Force slab pool cleanup
-        let old_pages = self.slab_manager.force_cleanup();
-        
-        // Defragment active arenas
-        let bytes_defragmented = self.zero_copy_manager.defragment_all().unwrap_or(0);
-        
-        let maintenance_time = start_time.elapsed();
-        
-        log::info!("Maintenance completed: {} inactive arenas, {} old pages, {} bytes defragmented in {:?}",
-                  inactive_arenas, old_pages, bytes_defragmented, maintenance_time);
-        
-        MaintenanceReport {
-            inactive_arenas_cleaned: inactive_arenas,
-            old_pages_cleaned: old_pages,
-            bytes_defragmented,
-            maintenance_time_ms: maintenance_time.as_millis() as f64,
-        }
-    }
-
-    // Helper methods
-    fn select_optimal_device(&self) -> i32 {
-        // Simple strategy: select device with lowest memory pressure
-        self.config.devices.iter()
-            .min_by_key(|&&device_id| {
-                self.cuda_context.device_stats(device_id)
-                    .map(|(allocated, _)| allocated)
-                    .unwrap_or(usize::MAX)
-            })
-            .copied()
-            .unwrap_or(0)
-    }
-
-    /// Batch allocate multiple sequences (for concurrent request processing)
-    pub fn batch_allocate_sequences(
-        &self,
-        requests: &[SequenceRequest],
-    ) -> Result<Vec<BatchAllocationResult>, LLMServerError> {
-        let mut results = Vec::with_capacity(requests.len());
-        
-        // Group requests by optimal device
-        let mut device_groups: std::collections::HashMap<i32, Vec<(usize, &SequenceRequest)>> = 
-            std::collections::HashMap::new();
-        
-        for (idx, req) in requests.iter().enumerate() {
-            let device = req.preferred_device.unwrap_or_else(|| self.select_optimal_device());
-            device_groups.entry(device).or_default().push((idx, req));
-        }
-        
-        // Store the number of device groups before consuming the HashMap
-        let num_device_groups = device_groups.len();
-        
-        // Process each device group
-        for (device, group) in device_groups {
-            for (idx, req) in group {
-                let arena = self.create_sequence_arena(
-                    req.initial_seq_len,
-                    req.max_seq_len,
-                    req.num_heads,
-                    req.head_dim,
-                    Some(device),
-                )?;
-                
-                let tensor = self.allocate_kv_tensor(
-                    &arena,
-                    req.initial_seq_len,
-                    req.max_seq_len,
-                    req.num_heads,
-                    req.head_dim,
-                    req.dtype_size,
-                )?;
-                
-                results.push(BatchAllocationResult {
-                    request_id: idx,
-                    arena,
-                    tensor,
-                    device_id: device,
-                });
-            }
-        }
-        
-        // Sort results by request_id to maintain order
-        results.sort_by_key(|r| r.request_id);
-        
-        log::info!("Batch allocated {} KV sequences across {} devices", 
-                  requests.len(), num_device_groups);
-        
-        Ok(results)
     }
 
     /// Create manager optimized for specific LLM model using KV-layout calculations
@@ -841,6 +641,433 @@ impl ProductionKVCacheManager {
         
         Self::new(config)
     }
+
+    /// Get production metrics
+    pub fn get_production_metrics(&self) -> ProductionMetricsReport {
+        let sequences = self.metrics.total_sequences_processed.load(Ordering::Relaxed);
+        let tokens = self.metrics.total_tokens_generated.load(Ordering::Relaxed);
+        let zero_copy = self.metrics.total_zero_copy_extensions.load(Ordering::Relaxed);
+        let copy = self.metrics.total_copy_extensions.load(Ordering::Relaxed);
+        let alloc_time = self.metrics.allocation_time_ns.load(Ordering::Relaxed);
+        let ext_time = self.metrics.extension_time_ns.load(Ordering::Relaxed);
+        let peak_memory = self.metrics.peak_memory_usage.load(Ordering::Relaxed);
+        
+        let total_extensions = zero_copy + copy;
+        let zero_copy_ratio = if total_extensions > 0 {
+            zero_copy as f64 / total_extensions as f64
+        } else {
+            0.0
+        };
+        
+        let avg_alloc_time = if sequences > 0 {
+            (alloc_time as f64 / sequences as f64) / 1_000_000.0 // Convert to ms
+        } else {
+            0.0
+        };
+        
+        let avg_ext_time = if total_extensions > 0 {
+            (ext_time as f64 / total_extensions as f64) / 1_000_000.0 // Convert to ms
+        } else {
+            0.0
+        };
+        
+        ProductionMetricsReport {
+            sequences_processed: sequences,
+            tokens_generated: tokens,
+            zero_copy_extensions: zero_copy,
+            copy_extensions: copy,
+            zero_copy_ratio,
+            avg_allocation_time_ms: avg_alloc_time,
+            avg_extension_time_ms: avg_ext_time,
+            peak_memory_usage_mb: peak_memory / (1024 * 1024),
+            zero_copy_stats: self.zero_copy_manager.global_stats(),
+            slab_stats: self.slab_pool.stats(),
+        }
+    }
+
+    /// Get system health and recommendations
+    pub fn get_system_health(&self) -> SystemHealthReport {
+        let metrics = self.get_production_metrics();
+        let recommendations = self.zero_copy_manager.get_recommendations();
+        let slab_recommendations = self.slab_manager.get_recommendations();
+        
+        // Calculate health score (0.0 = poor, 1.0 = excellent)
+        let mut health_score = 1.0;
+        
+        // Penalize low zero-copy ratio
+        if metrics.zero_copy_ratio < 0.8 {
+            health_score *= 0.8;
+        }
+        
+        // Penalize low slab recycling
+        if metrics.slab_stats.recycling_efficiency < 0.7 {
+            health_score *= 0.9;
+        }
+        
+        // Penalize high memory usage
+        if metrics.zero_copy_stats.memory_pressure() > 0.8 {
+            health_score *= 0.7;
+        }
+        
+        let status = if health_score > 0.9 {
+            SystemStatus::Excellent
+        } else if health_score > 0.7 {
+            SystemStatus::Good
+        } else if health_score > 0.5 {
+            SystemStatus::Warning
+        } else {
+            SystemStatus::Critical
+        };
+        
+        let mut all_recommendations = recommendations;
+        all_recommendations.extend(slab_recommendations);
+        
+        SystemHealthReport {
+            status,
+            health_score,
+            recommendations: all_recommendations,
+            metrics,
+        }
+    }
+
+    /// Force cleanup and optimization (for maintenance)
+    pub fn maintenance_cleanup(&self) -> MaintenanceReport {
+        let start_time = std::time::Instant::now();
+        
+        // Cleanup inactive arenas
+        let inactive_arenas = self.zero_copy_manager.cleanup_inactive_arenas();
+        
+        // Force slab pool cleanup
+        let old_pages = self.slab_manager.force_cleanup();
+        
+        // Defragment active arenas
+        let bytes_defragmented = self.zero_copy_manager.defragment_all().unwrap_or(0);
+        
+        let maintenance_time = start_time.elapsed();
+        
+        log::info!("Maintenance completed: {} inactive arenas, {} old pages, {} bytes defragmented in {:?}",
+                  inactive_arenas, old_pages, bytes_defragmented, maintenance_time);
+        
+        MaintenanceReport {
+            inactive_arenas_cleaned: inactive_arenas,
+            old_pages_cleaned: old_pages,
+            bytes_defragmented,
+            maintenance_time_ms: maintenance_time.as_millis() as f64,
+        }
+    }
+
+    /// Batch allocate multiple sequences (for concurrent request processing)
+    pub fn batch_allocate_sequences(
+        &self,
+        requests: &[SequenceRequest],
+    ) -> Result<Vec<BatchAllocationResult>, LLMServerError> {
+        let mut results = Vec::with_capacity(requests.len());
+        
+        // Group requests by optimal device
+        let mut device_groups: std::collections::HashMap<i32, Vec<(usize, &SequenceRequest)>> = 
+            std::collections::HashMap::new();
+        
+        for (idx, req) in requests.iter().enumerate() {
+            let device = req.preferred_device.unwrap_or_else(|| self.select_optimal_device());
+            device_groups.entry(device).or_default().push((idx, req));
+        }
+        
+        // Store the number of device groups before consuming the HashMap
+        let num_device_groups = device_groups.len();
+        
+        // Process each device group
+        for (device, group) in device_groups {
+            for (idx, req) in group {
+                let arena = self.create_sequence_arena(
+                    req.initial_seq_len,
+                    req.max_seq_len,
+                    req.num_heads,
+                    req.head_dim,
+                    Some(device),
+                )?;
+                
+                let tensor = self.allocate_kv_tensor(
+                    &arena,
+                    req.initial_seq_len,
+                    req.max_seq_len,
+                    req.num_heads,
+                    req.head_dim,
+                    req.dtype_size,
+                )?;
+                
+                results.push(BatchAllocationResult {
+                    request_id: idx,
+                    arena,
+                    tensor,
+                    device_id: device,
+                });
+            }
+        }
+        
+        // Sort results by request_id to maintain order
+        results.sort_by_key(|r| r.request_id);
+        
+        log::info!("Batch allocated {} KV sequences across {} devices", 
+                  requests.len(), num_device_groups);
+        
+        Ok(results)
+    }
+
+    /// Batch extend multiple tensors for generation (optimized for multi-sequence serving)
+    pub fn batch_extend_tensors_for_generation(
+        &self,
+        extensions: Vec<(Arc<SequenceArena>, &mut KVTensor, usize)>,
+    ) -> Result<Vec<bool>, LLMServerError> {
+        let start_time = std::time::Instant::now();
+        let mut results = Vec::with_capacity(extensions.len());
+        let mut total_zero_copy = 0;
+        let mut total_tokens = 0;
+        let extensions_len = extensions.len(); // Store length before consuming
+        
+        for (arena, tensor, new_tokens) in extensions {
+            let was_zero_copy = arena.extend_tensor_for_generation(tensor, new_tokens)?;
+            results.push(was_zero_copy);
+            
+            if was_zero_copy {
+                total_zero_copy += 1;
+            }
+            total_tokens += new_tokens;
+        }
+        
+        let batch_time = start_time.elapsed().as_nanos() as usize;
+        
+        // Update metrics
+        self.metrics.total_zero_copy_extensions.fetch_add(total_zero_copy, Ordering::Relaxed);
+        self.metrics.total_copy_extensions.fetch_add(extensions_len - total_zero_copy, Ordering::Relaxed);
+        self.metrics.total_tokens_generated.fetch_add(total_tokens, Ordering::Relaxed);
+        self.metrics.extension_time_ns.fetch_add(batch_time, Ordering::Relaxed);
+        
+        let zero_copy_rate = total_zero_copy as f64 / extensions_len as f64;
+        log::debug!("Batch zero-copy extension: {} sequences, {:.1}% zero-copy, {} total tokens, {}ns", 
+                   extensions_len, zero_copy_rate * 100.0, total_tokens, batch_time);
+        
+        Ok(results)
+    }
+
+    // Helper methods
+    fn select_optimal_device(&self) -> i32 {
+        // Simple strategy: select device with lowest memory pressure
+        self.config.devices.iter()
+            .min_by_key(|&&device_id| {
+                self.cuda_context.device_stats(device_id)
+                    .map(|(allocated, _)| allocated)
+                    .unwrap_or(usize::MAX)
+            })
+            .copied()
+            .unwrap_or(0)
+    }
+
+    /// Demonstrate zero-copy efficiency with actual measurement
+    pub fn measure_zero_copy_efficiency(
+        &self,
+        arena: &Arc<SequenceArena>,
+        tensor: &mut KVTensor,
+        extension_steps: &[usize],
+    ) -> Result<ZeroCopyEfficiencyReport, LLMServerError> {
+        let start_time = std::time::Instant::now();
+        let initial_seq_len = tensor.seq_len();
+        let initial_stats = tensor.zero_copy_stats();
+        
+        let mut step_results = Vec::new();
+        let mut total_zero_copy = 0;
+        let mut total_extensions = 0;
+        
+        for (step_idx, &tokens_to_add) in extension_steps.iter().enumerate() {
+            let step_start = std::time::Instant::now();
+            let pre_extension_len = tensor.seq_len();
+            
+            let was_zero_copy = self.extend_tensor_for_generation(arena, tensor, tokens_to_add)?;
+            
+            let step_time = step_start.elapsed();
+            let post_extension_len = tensor.seq_len();
+            
+            step_results.push(ZeroCopyStepResult {
+                step_index: step_idx,
+                tokens_added: tokens_to_add,
+                pre_length: pre_extension_len,
+                post_length: post_extension_len,
+                was_zero_copy,
+                step_time_ns: step_time.as_nanos() as u64,
+            });
+            
+            if was_zero_copy {
+                total_zero_copy += 1;
+            }
+            total_extensions += 1;
+            
+            // Stop if we hit capacity limit
+            if !was_zero_copy {
+                log::debug!("Stopping efficiency test at step {} - hit capacity limit", step_idx);
+                break;
+            }
+        }
+        
+        let total_time = start_time.elapsed();
+        let final_stats = tensor.zero_copy_stats();
+        let zero_copy_rate = total_zero_copy as f64 / total_extensions as f64;
+        
+        let report = ZeroCopyEfficiencyReport {
+            initial_seq_len,
+            final_seq_len: tensor.seq_len(),
+            initial_capacity: initial_stats.max_seq_len,
+            total_extensions,
+            zero_copy_extensions: total_zero_copy,
+            zero_copy_rate,
+            total_time_ns: total_time.as_nanos() as u64,
+            avg_extension_time_ns: if total_extensions > 0 { 
+                total_time.as_nanos() as u64 / total_extensions as u64 
+            } else { 0 },
+            initial_utilization: initial_stats.utilization,
+            final_utilization: final_stats.utilization,
+            memory_efficiency: final_stats.memory_efficiency,
+            step_results,
+        };
+        
+        log::info!("Zero-copy efficiency test completed:");
+        log::info!("  {} -> {} tokens, {:.1}% zero-copy rate", 
+                  initial_seq_len, tensor.seq_len(), zero_copy_rate * 100.0);
+        log::info!("  Avg extension time: {}ns", report.avg_extension_time_ns);
+        log::info!("  Final utilization: {:.1}%", final_stats.utilization * 100.0);
+        
+        Ok(report)
+    }
+
+    /// Validate that zero-copy is working correctly
+    pub fn validate_zero_copy_implementation(&self) -> Result<ZeroCopyValidationReport, LLMServerError> {
+        log::info!("Running zero-copy implementation validation...");
+        
+        // Create test arena with known capacity
+        let test_arena = self.create_sequence_arena(128, 1024, 16, 64, None)?;
+        
+        // Allocate test tensor
+        let mut test_tensor = self.allocate_kv_tensor(&test_arena, 128, 1024, 16, 64, 2)?;
+        
+        // Test 1: Basic zero-copy extension within capacity
+        let initial_len = test_tensor.seq_len();
+        let extension_result = self.extend_tensor_for_generation(&test_arena, &mut test_tensor, 64)?;
+        let post_extension_len = test_tensor.seq_len();
+        
+        let basic_zero_copy_works = extension_result && (post_extension_len == initial_len + 64);
+        
+        // Test 2: Extension beyond capacity should fail gracefully
+        let large_extension_result = self.extend_tensor_for_generation(&test_arena, &mut test_tensor, 2048)?;
+        let beyond_capacity_handled = !large_extension_result; // Should be false
+        
+        // Test 3: Memory efficiency validation
+        let tensor_stats = test_tensor.zero_copy_stats();
+        let memory_efficiency_ok = tensor_stats.memory_efficiency > 0.0 && tensor_stats.memory_efficiency <= 1.0;
+        
+        // Test 4: Capacity reporting accuracy
+        let capacity_reporting_ok = tensor_stats.max_seq_len == 1024 && 
+                                   tensor_stats.growth_capacity_remaining <= 1024;
+        
+        let validation_report = ZeroCopyValidationReport {
+            basic_zero_copy_works,
+            beyond_capacity_handled_correctly: beyond_capacity_handled,
+            memory_efficiency_reporting_ok: memory_efficiency_ok,
+            capacity_reporting_accurate: capacity_reporting_ok,
+            test_tensor_stats: tensor_stats,
+            all_tests_passed: basic_zero_copy_works && beyond_capacity_handled && 
+                             memory_efficiency_ok && capacity_reporting_ok,
+        };
+        
+        if validation_report.all_tests_passed {
+            log::info!("✅ Zero-copy implementation validation PASSED");
+        } else {
+            log::warn!("⚠️ Zero-copy implementation validation found issues");
+        }
+        
+        Ok(validation_report)
+    }
+
+    /// Get zero-copy performance recommendations
+    pub fn get_zero_copy_recommendations(&self) -> Vec<String> {
+        let metrics = self.get_production_metrics();
+        let mut recommendations = Vec::new();
+        
+        // Analyze zero-copy efficiency
+        if metrics.zero_copy_ratio < 0.8 {
+            recommendations.push(format!(
+                "Low zero-copy rate ({:.1}%) - consider increasing max_seq_len in arena allocation",
+                metrics.zero_copy_ratio * 100.0
+            ));
+        } else if metrics.zero_copy_ratio > 0.95 {
+            recommendations.push(
+                "Excellent zero-copy rate! Consider if you can reduce max_seq_len to save memory".to_string()
+            );
+        }
+        
+        // Analyze extension performance
+        if metrics.avg_extension_time_ms > 0.1 {
+            recommendations.push(format!(
+                "Extension time ({:.3}ms) higher than expected for zero-copy - verify implementation",
+                metrics.avg_extension_time_ms
+            ));
+        } else if metrics.avg_extension_time_ms < 0.001 {
+            recommendations.push(
+                "Excellent extension performance - true zero-copy is working optimally".to_string()
+            );
+        }
+        
+        // Memory efficiency recommendations
+        let slab_efficiency = metrics.slab_stats.recycling_efficiency;
+        if slab_efficiency < 0.5 {
+            recommendations.push(format!(
+                "Low slab recycling efficiency ({:.1}%) - consider page size optimization",
+                slab_efficiency * 100.0
+            ));
+        }
+        
+        // General recommendations
+        if recommendations.is_empty() {
+            recommendations.push("Zero-copy implementation is performing optimally".to_string());
+        }
+        
+        recommendations
+    }
+}
+
+/// Zero-copy efficiency measurement results
+#[derive(Debug, Clone)]
+pub struct ZeroCopyEfficiencyReport {
+    pub initial_seq_len: usize,
+    pub final_seq_len: usize,
+    pub initial_capacity: usize,
+    pub total_extensions: usize,
+    pub zero_copy_extensions: usize,
+    pub zero_copy_rate: f64,
+    pub total_time_ns: u64,
+    pub avg_extension_time_ns: u64,
+    pub initial_utilization: f64,
+    pub final_utilization: f64,
+    pub memory_efficiency: f64,
+    pub step_results: Vec<ZeroCopyStepResult>,
+}
+
+#[derive(Debug, Clone)]
+pub struct ZeroCopyStepResult {
+    pub step_index: usize,
+    pub tokens_added: usize,
+    pub pre_length: usize,
+    pub post_length: usize,
+    pub was_zero_copy: bool,
+    pub step_time_ns: u64,
+}
+
+/// Zero-copy implementation validation results
+#[derive(Debug, Clone)]
+pub struct ZeroCopyValidationReport {
+    pub basic_zero_copy_works: bool,
+    pub beyond_capacity_handled_correctly: bool,
+    pub memory_efficiency_reporting_ok: bool,
+    pub capacity_reporting_accurate: bool,
+    pub test_tensor_stats: ZeroCopyStats,
+    pub all_tests_passed: bool,
 }
 
 /// Request for sequence allocation with KV-specific parameters

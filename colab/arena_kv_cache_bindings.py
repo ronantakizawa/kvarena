@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Enhanced Python bindings for Arena KV-Cache with CUDA support and KV-specific optimizations.
-Provides KV tensor creation from arena memory with proper layout calculations as per project spec:
-"Page size = round-up of largest KV tensor you expect (e.g., 256 KiB for 4-bit 8K-seq Llama-2)"
+Fixed Python bindings for Arena KV-Cache with correct parameter mapping.
+The Rust FFI expects (seq_len, hidden_dim, num_heads, dtype_size) but we need to
+calculate head_dim = hidden_dim / num_heads internally for KV tensor layout.
 """
 
 import ctypes
@@ -105,10 +105,11 @@ def _setup_function_signatures():
         _lib.sequence_arena_free.argtypes = [ctypes.c_void_p]
         _lib.sequence_arena_free.restype = None
         
+        # FIXED: This function expects (arena, seq_len, hidden_dim, num_heads, dtype_size, offset_out, size_out)
         _lib.sequence_arena_allocate_tensor.argtypes = [
             ctypes.c_void_p,  # arena
             ctypes.c_size_t,  # seq_len
-            ctypes.c_size_t,  # hidden_dim (will be converted to head_dim internally)
+            ctypes.c_size_t,  # hidden_dim (NOT head_dim)
             ctypes.c_size_t,  # num_heads
             ctypes.c_size_t,  # dtype_size
             ctypes.POINTER(ctypes.c_size_t),  # offset_out
@@ -439,6 +440,7 @@ class SequenceArena:
         Returns:
             Tuple of (offset, size) for compatibility
         """
+        # FIXED: Calculate hidden_dim from num_heads * head_dim as the Rust FFI expects
         hidden_dim = num_heads * head_dim
         offset = ctypes.c_size_t()
         size = ctypes.c_size_t()
@@ -469,7 +471,7 @@ class SequenceArena:
                                    dtype: torch.dtype = torch.float16,
                                    device: str = 'cpu') -> Tuple[torch.Tensor, torch.Tensor, Tuple[int, int]]:
         """
-        Allocate arena memory and create KV PyTorch tensors in one call with proper layout.
+        FIXED: Allocate arena memory and create KV PyTorch tensors with correct parameter mapping.
         
         Args:
             seq_len: Sequence length
@@ -483,6 +485,8 @@ class SequenceArena:
         """
         device = validate_cuda_device(device)
         dtype_size = torch.tensor([], dtype=dtype).element_size()
+        
+        # FIXED: Call allocate_kv_tensor with the correct parameters
         offset, size = self.allocate_kv_tensor(seq_len, num_heads, head_dim, dtype_size)
         
         # Create KV tensors with the expected shape: [seq_len, num_heads, head_dim]
@@ -521,6 +525,7 @@ class SequenceArena:
         # Try to extend using the arena function if available
         if _lib.sequence_arena_extend_tensor is not None:
             try:
+                # FIXED: Calculate hidden_dim correctly for the FFI call
                 hidden_dim = num_heads * head_dim
                 extended_in_place = ctypes.c_int()
                 new_offset = ctypes.c_size_t()
