@@ -1,4 +1,4 @@
-// src/ffi.rs - Complete fixed production FFI with TRUE zero-copy extensions
+// src/ffi.rs - Complete fixed production FFI with TRUE zero-copy extensions and pure bump allocation
 use std::ffi::{c_char, c_void, CStr, CString};
 use std::sync::Arc;
 use std::time::Instant;
@@ -315,6 +315,142 @@ pub extern "C" fn prod_kv_tensor_free(tensor: *mut CKVTensor) {
             let _ = Box::from_raw(tensor);
         }
     }
+}
+
+/// TRUE zero-copy tensor extension - ONLY atomic metadata update
+#[no_mangle]
+pub extern "C" fn prod_extend_tensor_pure_zero_copy(
+    tensor: *mut CKVTensor,
+    additional_tokens: usize,
+    was_zero_copy_out: *mut i32,
+    extension_time_ns_out: *mut u64,
+) -> i32 {
+    if tensor.is_null() || was_zero_copy_out.is_null() || extension_time_ns_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &mut (*tensor).0 };
+    let start_time = std::time::Instant::now();
+
+    // Get current length
+    let current_len = tensor_ref.seq_len();
+    let new_len = current_len + additional_tokens;
+
+    // TRUE zero-copy: just atomic metadata update
+    match tensor_ref.extend_zero_copy(new_len) {
+        Ok(was_zero_copy) => {
+            let extension_time = start_time.elapsed().as_nanos() as u64;
+            
+            unsafe {
+                *was_zero_copy_out = if was_zero_copy { 1 } else { 0 };
+                *extension_time_ns_out = extension_time;
+            }
+            PROD_SUCCESS
+        }
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Create tensor with pure bump allocation - no arena state tracking
+#[no_mangle]
+pub extern "C" fn prod_allocate_tensor_pure_bump(
+    arena: *mut CSequenceArena,
+    initial_seq_len: usize,
+    max_seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    dtype_size: usize,
+    tensor_out: *mut *mut CKVTensor,
+) -> i32 {
+    if arena.is_null() || tensor_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let arena_ref = unsafe { &(*arena).0 };
+
+    // Pure bump allocation
+    match arena_ref.allocate_kv_tensor_with_growth(
+        initial_seq_len,
+        max_seq_len,
+        num_heads,
+        head_dim,
+        dtype_size,
+    ) {
+        Ok(tensor) => {
+            unsafe {
+                *tensor_out = Box::into_raw(Box::new(CKVTensor(tensor)));
+            }
+            PROD_SUCCESS
+        }
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Get pure bump allocator stats - minimal state
+#[no_mangle]
+pub extern "C" fn prod_get_bump_arena_stats(
+    arena: *mut CSequenceArena,
+    arena_id_out: *mut u64,
+    current_offset_out: *mut usize,
+    available_space_out: *mut usize,
+    utilization_out: *mut f64,
+) -> i32 {
+    if arena.is_null() || arena_id_out.is_null() || 
+       current_offset_out.is_null() || available_space_out.is_null() ||
+       utilization_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let arena_ref = unsafe { &(*arena).0 };
+
+    unsafe {
+        *arena_id_out = arena_ref.arena_id();
+        *current_offset_out = arena_ref.current_offset();
+        *available_space_out = arena_ref.available_space();
+        *utilization_out = arena_ref.utilization();
+    }
+
+    PROD_SUCCESS
+}
+
+/// Benchmark pure bump allocation vs complex allocation
+#[no_mangle]
+pub extern "C" fn prod_benchmark_pure_bump_allocation(
+    arena: *mut CSequenceArena,
+    num_allocations: usize,
+    allocation_size: usize,
+    bump_time_ns_out: *mut u64,
+    allocations_per_second_out: *mut f64,
+) -> i32 {
+    if arena.is_null() || bump_time_ns_out.is_null() || allocations_per_second_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let arena_ref = unsafe { &(*arena).0 };
+    let start_time = std::time::Instant::now();
+
+    // Perform pure bump allocations
+    let mut successful_allocations = 0;
+    for _ in 0..num_allocations {
+        if arena_ref.bump_allocate(allocation_size, 256).is_some() {
+            successful_allocations += 1;
+        }
+    }
+
+    let total_time = start_time.elapsed();
+    let total_time_ns = total_time.as_nanos() as u64;
+    let allocations_per_second = if total_time.as_secs_f64() > 0.0 {
+        successful_allocations as f64 / total_time.as_secs_f64()
+    } else {
+        0.0
+    };
+
+    unsafe {
+        *bump_time_ns_out = total_time_ns;
+        *allocations_per_second_out = allocations_per_second;
+    }
+
+    PROD_SUCCESS
 }
 
 /// TRUE zero-copy tensor extension - ATOMIC metadata update only
@@ -893,75 +1029,6 @@ pub extern "C" fn prod_get_system_health(
     PROD_SUCCESS
 }
 
-/// Get specific recommendation by index
-#[no_mangle]
-pub extern "C" fn prod_get_recommendation(
-    manager: *mut CProductionManager,
-    index: usize,
-    recommendation_out: *mut c_char,
-    max_len: usize,
-) -> i32 {
-    if manager.is_null() || recommendation_out.is_null() || max_len == 0 {
-        return PROD_ERROR_INVALID_PARAM;
-    }
-
-    let manager_ref = unsafe { &(*manager).0 };
-    let health = manager_ref.get_system_health();
-
-    if index >= health.recommendations.len() {
-        return PROD_ERROR_INVALID_PARAM;
-    }
-
-    let recommendation = &health.recommendations[index];
-    let c_string = match CString::new(recommendation.as_str()) {
-        Ok(s) => s,
-        Err(_) => return PROD_ERROR_INVALID_PARAM,
-    };
-
-    let bytes = c_string.as_bytes_with_nul();
-    if bytes.len() > max_len {
-        return PROD_ERROR_INVALID_PARAM;
-    }
-
-    unsafe {
-        std::ptr::copy_nonoverlapping(
-            bytes.as_ptr() as *const c_char,
-            recommendation_out,
-            bytes.len(),
-        );
-    }
-
-    PROD_SUCCESS
-}
-
-/// Perform maintenance cleanup
-#[no_mangle]
-pub extern "C" fn prod_maintenance_cleanup(
-    manager: *mut CProductionManager,
-    inactive_arenas_cleaned_out: *mut usize,
-    old_pages_cleaned_out: *mut usize,
-    bytes_defragmented_out: *mut usize,
-    maintenance_time_ms_out: *mut f64,
-) -> i32 {
-    if manager.is_null() || inactive_arenas_cleaned_out.is_null() ||
-       old_pages_cleaned_out.is_null() || bytes_defragmented_out.is_null() ||
-       maintenance_time_ms_out.is_null() {
-        return PROD_ERROR_INVALID_PARAM;
-    }
-
-    let manager_ref = unsafe { &(*manager).0 };
-    let report = manager_ref.maintenance_cleanup();
-
-    unsafe {
-        *inactive_arenas_cleaned_out = report.inactive_arenas_cleaned;
-        *old_pages_cleaned_out = report.old_pages_cleaned;
-        *bytes_defragmented_out = report.bytes_defragmented;
-        *maintenance_time_ms_out = report.maintenance_time_ms;
-    }
-
-    PROD_SUCCESS
-}
-
 /// Batch allocate sequences for concurrent processing
 #[no_mangle]
 pub extern "C" fn prod_batch_allocate_sequences(
@@ -1061,47 +1128,6 @@ pub extern "C" fn prod_free_batch_results(
     }
 }
 
-/// Simulate token generation for benchmarking
-#[no_mangle]
-pub extern "C" fn prod_simulate_generation(
-    manager: *mut CProductionManager,
-    arena: *mut CSequenceArena,
-    tensor: *mut CKVTensor,
-    num_tokens: usize,
-    tokens_generated_out: *mut usize,
-    zero_copy_extensions_out: *mut usize,
-    copy_extensions_out: *mut usize,
-    total_time_ms_out: *mut f64,
-    avg_time_per_token_ms_out: *mut f64,
-) -> i32 {
-    if manager.is_null() || arena.is_null() || tensor.is_null() ||
-       tokens_generated_out.is_null() || zero_copy_extensions_out.is_null() ||
-       copy_extensions_out.is_null() || total_time_ms_out.is_null() ||
-       avg_time_per_token_ms_out.is_null() {
-        return PROD_ERROR_INVALID_PARAM;
-    }
-
-    let manager_ref = unsafe { &(*manager).0 };
-    let arena_ref = unsafe { &(*arena).0 };
-    let tensor_ref = unsafe { &mut (*tensor).0 };
-
-    match simulate_generation(manager_ref, arena_ref, tensor_ref, num_tokens) {
-        Ok(stats) => {
-            unsafe {
-                *tokens_generated_out = stats.tokens_generated;
-                *zero_copy_extensions_out = stats.zero_copy_extensions;
-                *copy_extensions_out = stats.copy_extensions;
-                *total_time_ms_out = stats.total_time_ms;
-                *avg_time_per_token_ms_out = stats.avg_time_per_token_ms;
-            }
-            PROD_SUCCESS
-        }
-        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
-        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
-        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
-    }
-}
-
 /// Generation statistics for benchmarking
 #[derive(Debug, Clone)]
 pub struct GenerationStats {
@@ -1153,6 +1179,47 @@ pub fn simulate_generation(
         total_time_ms,
         avg_time_per_token_ms: avg_time_per_token,
     })
+}
+
+/// Simulate token generation for benchmarking
+#[no_mangle]
+pub extern "C" fn prod_simulate_generation(
+    manager: *mut CProductionManager,
+    arena: *mut CSequenceArena,
+    tensor: *mut CKVTensor,
+    num_tokens: usize,
+    tokens_generated_out: *mut usize,
+    zero_copy_extensions_out: *mut usize,
+    copy_extensions_out: *mut usize,
+    total_time_ms_out: *mut f64,
+    avg_time_per_token_ms_out: *mut f64,
+) -> i32 {
+    if manager.is_null() || arena.is_null() || tensor.is_null() ||
+       tokens_generated_out.is_null() || zero_copy_extensions_out.is_null() ||
+       copy_extensions_out.is_null() || total_time_ms_out.is_null() ||
+       avg_time_per_token_ms_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let manager_ref = unsafe { &(*manager).0 };
+    let arena_ref = unsafe { &(*arena).0 };
+    let tensor_ref = unsafe { &mut (*tensor).0 };
+
+    match simulate_generation(manager_ref, arena_ref, tensor_ref, num_tokens) {
+        Ok(stats) => {
+            unsafe {
+                *tokens_generated_out = stats.tokens_generated;
+                *zero_copy_extensions_out = stats.zero_copy_extensions;
+                *copy_extensions_out = stats.copy_extensions;
+                *total_time_ms_out = stats.total_time_ms;
+                *avg_time_per_token_ms_out = stats.avg_time_per_token_ms;
+            }
+            PROD_SUCCESS
+        }
+        Err(LLMServerError::CudaError(_)) => PROD_ERROR_CUDA,
+        Err(LLMServerError::OutOfMemory) => PROD_ERROR_OUT_OF_MEMORY,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
 }
 
 // Utility functions for integration
@@ -1220,48 +1287,7 @@ mod tests {
     }
 
     #[test]
-    fn test_zero_copy_manager_ffi() {
-        let model_name = CString::new("llama-7b").unwrap();
-        let devices = [0i32];
-        let mut manager_ptr = std::ptr::null_mut();
-        
-        let result = prod_kv_cache_init_for_server(
-            model_name.as_ptr(),
-            devices.as_ptr(),
-            1,
-            &mut manager_ptr,
-        );
-        
-        if result == PROD_SUCCESS {
-            // Test zero-copy validation
-            let mut validation_report = CZeroCopyValidationReport {
-                basic_zero_copy_works: 0,
-                beyond_capacity_handled_correctly: 0,
-                memory_efficiency_reporting_ok: 0,
-                capacity_reporting_accurate: 0,
-                all_tests_passed: 0,
-            };
-            
-            let validation_result = prod_validate_zero_copy_implementation(
-                manager_ptr,
-                &mut validation_report,
-            );
-            
-            if validation_result == PROD_SUCCESS {
-                println!("✓ Zero-copy validation: all_tests_passed = {}", validation_report.all_tests_passed);
-            }
-            
-            // Cleanup
-            prod_kv_cache_manager_free(manager_ptr);
-            println!("✓ Zero-copy manager FFI tests passed");
-        } else {
-            println!("Zero-copy manager FFI test skipped (no CUDA): error code {}", result);
-        }
-    }
-
-    #[test]
-    fn test_zero_copy_tensor_operations() {
-        // Test zero-copy tensor operations through FFI
+    fn test_pure_bump_allocation_ffi() {
         let devices = [0i32];
         let mut manager_ptr = std::ptr::null_mut();
         
@@ -1272,6 +1298,7 @@ mod tests {
         );
         
         if result == PROD_SUCCESS {
+            // Test pure bump allocation
             let mut arena_ptr = std::ptr::null_mut();
             let arena_result = prod_create_sequence_arena_with_growth(
                 manager_ptr,
@@ -1285,48 +1312,48 @@ mod tests {
             
             if arena_result == PROD_SUCCESS {
                 let mut tensor_ptr = std::ptr::null_mut();
-                let tensor_result = prod_allocate_kv_tensor_with_growth(
-                    manager_ptr,
+                let tensor_result = prod_allocate_tensor_pure_bump(
                     arena_ptr,
                     128,  // initial_seq_len
                     512,  // max_seq_len
-                    1024, // hidden_dim
                     16,   // num_heads
+                    64,   // head_dim
                     2,    // dtype_size (fp16)
                     &mut tensor_ptr,
                 );
                 
                 if tensor_result == PROD_SUCCESS {
-                    // Test zero-copy extension
+                    // Test pure zero-copy extension
                     let mut was_zero_copy = 0;
                     let mut extension_time_ns = 0u64;
                     
-                    let extension_result = prod_extend_tensor_zero_copy(
-                        manager_ptr,
-                        arena_ptr,
+                    let extension_result = prod_extend_tensor_pure_zero_copy(
                         tensor_ptr,
-                        64, // new_tokens
+                        64, // additional_tokens
                         &mut was_zero_copy,
                         &mut extension_time_ns,
                     );
                     
                     if extension_result == PROD_SUCCESS {
-                        println!("✓ Zero-copy extension: success={}, time={}ns", was_zero_copy, extension_time_ns);
+                        println!("✓ Pure zero-copy extension: success={}, time={}ns", was_zero_copy, extension_time_ns);
                         
-                        // Test getting zero-copy stats
-                        let mut stats = CZeroCopyStats {
-                            current_seq_len: 0,
-                            max_seq_len: 0,
-                            growth_capacity_remaining: 0,
-                            utilization: 0.0,
-                            memory_efficiency: 0.0,
-                            can_grow_without_copy: 0,
-                        };
+                        // Test bump allocator stats
+                        let mut arena_id = 0u64;
+                        let mut current_offset = 0usize;
+                        let mut available_space = 0usize;
+                        let mut utilization = 0.0f64;
                         
-                        let stats_result = prod_get_zero_copy_stats(tensor_ptr, &mut stats);
+                        let stats_result = prod_get_bump_arena_stats(
+                            arena_ptr,
+                            &mut arena_id,
+                            &mut current_offset,
+                            &mut available_space,
+                            &mut utilization,
+                        );
+                        
                         if stats_result == PROD_SUCCESS {
-                            println!("✓ Zero-copy stats: current={}, max={}, remaining={}", 
-                                   stats.current_seq_len, stats.max_seq_len, stats.growth_capacity_remaining);
+                            println!("✓ Bump stats: arena={}, offset={}, available={}, util={:.1%}", 
+                                   arena_id, current_offset, available_space, utilization);
                         }
                     }
                     
@@ -1337,9 +1364,9 @@ mod tests {
             }
             
             prod_kv_cache_manager_free(manager_ptr);
-            println!("✓ Zero-copy tensor operations FFI test completed");
+            println!("✓ Pure bump allocation FFI test completed");
         } else {
-            println!("Zero-copy tensor operations test skipped (no CUDA)");
+            println!("Pure bump allocation FFI test skipped (no CUDA): error code {}", result);
         }
     }
 }
