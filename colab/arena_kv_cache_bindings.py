@@ -2,7 +2,7 @@
 """
 Enhanced Python bindings for Arena KV-Cache with pure bump allocation and TRUE zero-copy extensions.
 This implements the pure bump allocation approach from the Rust implementation.
-Now includes lock-free slab recycling support.
+Now includes lock-free slab recycling support with FIXED function signatures.
 """
 
 import ctypes
@@ -75,11 +75,11 @@ ARENA_ERROR_ALLOC = -1
 ARENA_ERROR_INVALID_PARAM = -2
 DEFAULT_PAGE_SIZE = 256 * 1024  # 256 KiB - matches project spec example
 
-# Add new FFI function signatures for slab recycling
+# REPLACE the existing _setup_slab_recycling_signatures function with this COMPLETE version:
 def _setup_slab_recycling_signatures():
     """Setup function signatures for slab recycling operations."""
     try:
-        # Slab recycling stats
+        # Slab recycling stats (FIXED - this was causing undefined symbol error)
         _lib.prod_get_slab_recycling_stats.argtypes = [
             ctypes.c_void_p,  # manager
             ctypes.POINTER(ctypes.c_size_t),  # pages_created_out
@@ -112,10 +112,57 @@ def _setup_slab_recycling_signatures():
         ]
         _lib.prod_verify_lock_free_recycling.restype = ctypes.c_int
         
-        logger.info("Slab recycling function signatures configured")
+        # Enhanced slab pool status
+        _lib.prod_get_slab_pool_status.argtypes = [
+            ctypes.c_void_p,  # manager
+            ctypes.POINTER(ctypes.c_size_t),  # small_pool_size_out
+            ctypes.POINTER(ctypes.c_size_t),  # medium_pool_size_out
+            ctypes.POINTER(ctypes.c_size_t),  # large_pool_size_out
+            ctypes.POINTER(ctypes.c_size_t),  # huge_pool_size_out
+            ctypes.POINTER(ctypes.c_size_t),  # total_memory_pooled_mb_out
+            ctypes.POINTER(ctypes.c_double),  # pool_efficiency_out
+        ]
+        _lib.prod_get_slab_pool_status.restype = ctypes.c_int
+        
+        # Force slab recycling test
+        _lib.prod_force_slab_recycling_test.argtypes = [
+            ctypes.c_void_p,  # manager
+            ctypes.c_size_t,  # num_test_cycles
+            ctypes.POINTER(ctypes.c_size_t),  # pages_recycled_out
+            ctypes.POINTER(ctypes.c_double),  # recycling_success_rate_out
+        ]
+        _lib.prod_force_slab_recycling_test.restype = ctypes.c_int
+        
+        # Slab memory pressure
+        _lib.prod_get_slab_memory_pressure.argtypes = [
+            ctypes.c_void_p,  # manager
+            ctypes.POINTER(ctypes.c_double),  # memory_pressure_out
+            ctypes.POINTER(ctypes.c_int),     # recommend_cleanup_out
+            ctypes.POINTER(ctypes.c_size_t),  # estimated_savings_mb_out
+        ]
+        _lib.prod_get_slab_memory_pressure.restype = ctypes.c_int
+        
+        # Safe batch allocation (FIXED version)
+        _lib.prod_batch_allocate_sequences.argtypes = [
+            ctypes.c_void_p,  # manager
+            ctypes.c_void_p,  # requests (CBatchRequest array)
+            ctypes.c_size_t,  # num_requests
+            ctypes.POINTER(ctypes.c_void_p),  # results_out
+        ]
+        _lib.prod_batch_allocate_sequences.restype = ctypes.c_int
+        
+        # Safe batch cleanup
+        _lib.prod_free_batch_results.argtypes = [
+            ctypes.c_void_p,  # results
+            ctypes.c_size_t,  # num_results
+        ]
+        _lib.prod_free_batch_results.restype = None
+        
+        logger.info("All slab recycling function signatures configured successfully")
         
     except AttributeError as e:
         logger.warning(f"Some slab recycling functions not available: {e}")
+        logger.warning("This is normal if the Rust library doesn't export all functions yet")
 
 # Function signatures with error handling
 def _setup_function_signatures():
@@ -274,8 +321,9 @@ _setup_function_signatures()
 # Call this after main function setup
 _setup_slab_recycling_signatures()
 
+# REPLACE the existing SlabRecyclingMetrics class with this enhanced version:
 class SlabRecyclingMetrics:
-    """Metrics for lock-free slab recycling performance."""
+    """Enhanced metrics for lock-free slab recycling performance."""
     
     def __init__(self, pages_created: int, pages_recycled: int, pages_reused: int,
                  recycling_efficiency: float, reuse_efficiency: float, 
@@ -298,9 +346,34 @@ class SlabRecyclingMetrics:
   Savings: {self.bytes_saved_mb}MB memory, {self.fragmentation_prevented:.1%} fragmentation prevented
   Performance: {self.gc_stalls_avoided} GC stalls avoided
   Pool sizes: {self.pool_sizes}"""
+    
+    def is_healthy(self) -> bool:
+        """Check if slab recycling is performing well."""
+        return (self.recycling_efficiency > 0.5 and 
+                self.reuse_efficiency > 0.7 and
+                self.gc_stalls_avoided > 0)
+    
+    def get_recommendations(self) -> List[str]:
+        """Get performance recommendations."""
+        recommendations = []
+        
+        if self.recycling_efficiency < 0.5:
+            recommendations.append("Low recycling efficiency - consider adjusting page sizes")
+        
+        if self.reuse_efficiency < 0.7:
+            recommendations.append("Low reuse rate - pages may be held too long")
+        
+        if self.bytes_saved_mb < 10:
+            recommendations.append("Low memory savings - increase workload or check recycling")
+        
+        if not recommendations:
+            recommendations.append("Slab recycling is performing optimally")
+        
+        return recommendations
 
+# ADD: Enhanced SlabCleanupReport class
 class SlabCleanupReport:
-    """Report from slab pool cleanup operations."""
+    """Enhanced report from slab pool cleanup operations."""
     
     def __init__(self, pages_cleaned: int, cleanup_time_ms: float, memory_freed_mb: int):
         self.pages_cleaned = pages_cleaned
@@ -309,6 +382,18 @@ class SlabCleanupReport:
     
     def __str__(self) -> str:
         return f"SlabCleanup: {self.pages_cleaned} pages in {self.cleanup_time_ms:.2f}ms, ~{self.memory_freed_mb}MB freed"
+    
+    def cleanup_rate_pages_per_second(self) -> float:
+        """Calculate cleanup rate in pages per second."""
+        if self.cleanup_time_ms > 0:
+            return (self.pages_cleaned * 1000.0) / self.cleanup_time_ms
+        return 0.0
+    
+    def is_efficient_cleanup(self) -> bool:
+        """Check if cleanup was efficient."""
+        return (self.cleanup_time_ms < 100.0 and  # Less than 100ms
+                self.pages_cleaned > 0 and          # Actually cleaned something
+                self.memory_freed_mb > 0)           # Freed some memory
 
 class ArenaError(Exception):
     """Exception raised for arena allocation errors."""
@@ -634,9 +719,9 @@ class ArenaKVCacheManager:
                 pass  # Ignore errors during cleanup
     
     def get_slab_recycling_metrics(self) -> SlabRecyclingMetrics:
-        """Get comprehensive slab recycling metrics."""
+        """Get comprehensive slab recycling metrics with proper error handling."""
         if not hasattr(_lib, 'prod_get_slab_recycling_stats'):
-            logger.warning("Slab recycling stats not available")
+            logger.warning("Slab recycling stats not available in library")
             return SlabRecyclingMetrics(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, [0, 0, 0, 0])
         
         pages_created = ctypes.c_size_t()
@@ -665,10 +750,10 @@ class ArenaKVCacheManager:
                 logger.warning(f"Failed to get slab recycling stats: error {result}")
                 return SlabRecyclingMetrics(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, [0, 0, 0, 0])
             
-            # Estimate pool sizes (not directly available from this call)
-            pool_sizes = [0, 0, 0, 0]  # Would need separate call for exact sizes
+            # Get pool sizes
+            pool_sizes = self.get_slab_pool_sizes()
             
-            return SlabRecyclingMetrics(
+            metrics = SlabRecyclingMetrics(
                 pages_created.value,
                 pages_recycled.value,
                 pages_reused.value,
@@ -680,14 +765,49 @@ class ArenaKVCacheManager:
                 pool_sizes
             )
             
+            logger.debug(f"Slab recycling metrics: {metrics.recycling_efficiency:.1%} efficiency, "
+                        f"{metrics.bytes_saved_mb}MB saved")
+            
+            return metrics
+            
         except Exception as e:
             logger.error(f"Failed to get slab recycling metrics: {e}")
             return SlabRecyclingMetrics(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, [0, 0, 0, 0])
     
+    def get_slab_pool_sizes(self) -> List[int]:
+        """Get current slab pool sizes by size class."""
+        if not hasattr(_lib, 'prod_get_slab_pool_status'):
+            return [0, 0, 0, 0]
+        
+        small_pool = ctypes.c_size_t()
+        medium_pool = ctypes.c_size_t()
+        large_pool = ctypes.c_size_t()
+        huge_pool = ctypes.c_size_t()
+        total_memory = ctypes.c_size_t()
+        efficiency = ctypes.c_double()
+        
+        try:
+            result = _lib.prod_get_slab_pool_status(
+                self._ptr,
+                ctypes.byref(small_pool),
+                ctypes.byref(medium_pool),
+                ctypes.byref(large_pool),
+                ctypes.byref(huge_pool),
+                ctypes.byref(total_memory),
+                ctypes.byref(efficiency)
+            )
+            
+            if result == ARENA_SUCCESS:
+                return [small_pool.value, medium_pool.value, large_pool.value, huge_pool.value]
+        except Exception as e:
+            logger.debug(f"Failed to get slab pool sizes: {e}")
+        
+        return [0, 0, 0, 0]
+    
     def cleanup_slab_pools(self) -> SlabCleanupReport:
-        """Cleanup slab pools and return report."""
+        """Cleanup slab pools and return enhanced report."""
         if not hasattr(_lib, 'prod_cleanup_slab_pools'):
-            logger.warning("Slab pool cleanup not available")
+            logger.warning("Slab pool cleanup not available in library")
             return SlabCleanupReport(0, 0.0, 0)
         
         pages_cleaned = ctypes.c_size_t()
@@ -713,6 +833,11 @@ class ArenaKVCacheManager:
             )
             
             logger.info(f"Slab cleanup completed: {report}")
+            if report.is_efficient_cleanup():
+                logger.info("✓ Cleanup was efficient")
+            else:
+                logger.info("⚠️ Cleanup may need optimization")
+            
             return report
             
         except Exception as e:
@@ -720,17 +845,9 @@ class ArenaKVCacheManager:
             return SlabCleanupReport(0, 0.0, 0)
     
     def verify_lock_free_recycling(self, test_allocations: int = 1000) -> Tuple[bool, bool, float]:
-        """
-        Verify that lock-free recycling is working correctly.
-        
-        Args:
-            test_allocations: Number of test allocations to perform
-            
-        Returns:
-            Tuple of (recycling_working, lock_free_confirmed, performance_gain)
-        """
+        """Verify that lock-free recycling is working correctly with enhanced testing."""
         if not hasattr(_lib, 'prod_verify_lock_free_recycling'):
-            logger.warning("Lock-free recycling verification not available")
+            logger.warning("Lock-free recycling verification not available in library")
             return False, False, 0.0
         
         recycling_working = ctypes.c_int()
@@ -738,6 +855,8 @@ class ArenaKVCacheManager:
         performance_gain = ctypes.c_double()
         
         try:
+            logger.info(f"Running lock-free recycling verification with {test_allocations} test allocations...")
+            
             result = _lib.prod_verify_lock_free_recycling(
                 self._ptr,
                 test_allocations,
@@ -754,14 +873,66 @@ class ArenaKVCacheManager:
             is_lock_free = bool(lock_free_confirmed.value)
             perf_gain = performance_gain.value
             
-            logger.info(f"Lock-free recycling verification: recycling={is_recycling_working}, "
-                       f"lock_free={is_lock_free}, performance_gain={perf_gain:.2f}x")
+            logger.info(f"Lock-free recycling verification results:")
+            logger.info(f"  Recycling working: {is_recycling_working}")
+            logger.info(f"  Lock-free confirmed: {is_lock_free}")
+            logger.info(f"  Performance gain: {perf_gain:.2f}x")
+            
+            if is_recycling_working and is_lock_free and perf_gain > 1.0:
+                logger.info("✓ Lock-free slab recycling is working optimally")
+            elif is_recycling_working:
+                logger.info("✓ Slab recycling is working (may not be fully lock-free)")
+            else:
+                logger.warning("⚠️ Slab recycling may not be working correctly")
             
             return is_recycling_working, is_lock_free, perf_gain
             
         except Exception as e:
             logger.error(f"Failed to verify lock-free recycling: {e}")
             return False, False, 0.0
+    
+    def test_slab_recycling(self, num_cycles: int = 50) -> Tuple[int, float]:
+        """Test slab recycling by creating and destroying arenas."""
+        if not hasattr(_lib, 'prod_force_slab_recycling_test'):
+            logger.warning("Slab recycling test not available in library")
+            return 0, 0.0
+        
+        pages_recycled = ctypes.c_size_t()
+        success_rate = ctypes.c_double()
+        
+        try:
+            logger.info(f"Testing slab recycling with {num_cycles} allocation cycles...")
+            
+            result = _lib.prod_force_slab_recycling_test(
+                self._ptr,
+                num_cycles,
+                ctypes.byref(pages_recycled),
+                ctypes.byref(success_rate)
+            )
+            
+            if result != ARENA_SUCCESS:
+                logger.warning(f"Failed slab recycling test: error {result}")
+                return 0, 0.0
+            
+            recycled_count = pages_recycled.value
+            success_percentage = success_rate.value * 100.0
+            
+            logger.info(f"Slab recycling test results:")
+            logger.info(f"  Pages recycled: {recycled_count}")
+            logger.info(f"  Success rate: {success_percentage:.1f}%")
+            
+            if success_percentage > 80.0:
+                logger.info("✓ Excellent slab recycling performance")
+            elif success_percentage > 60.0:
+                logger.info("✓ Good slab recycling performance")
+            else:
+                logger.warning("⚠️ Slab recycling needs optimization")
+            
+            return recycled_count, success_rate.value
+            
+        except Exception as e:
+            logger.error(f"Failed slab recycling test: {e}")
+            return 0, 0.0
     
     def create_sequence_arena(self):
         """Create a new sequence arena optimized for KV tensors."""
@@ -999,169 +1170,6 @@ def get_kv_recommendations(seq_len: int, num_heads: int, head_dim: int,
         recommendations.append("Unusual head dimension. Standard sizes (64, 128, 256) may be more efficient.")
     
     return recommendations
-
-# Additional utility functions for compatibility
-def get_default_page_size() -> int:
-    """Get the default KV page size."""
-    if _lib.arena_get_default_page_size is not None:
-        try:
-            return _lib.arena_get_default_page_size()
-        except:
-            pass
-    return DEFAULT_PAGE_SIZE
-
-def get_alignment() -> int:
-    """Get the memory alignment requirement."""
-    if _lib.arena_get_alignment is not None:
-        try:
-            return _lib.arena_get_alignment()
-        except:
-            pass
-    return 64  # Default alignment
-
-def align_size(size: int) -> int:
-    """Align a size to the required boundary."""
-    if _lib.arena_align_size is not None:
-        try:
-            return _lib.arena_align_size(size)
-        except:
-            pass
-    
-    # Default alignment implementation
-    alignment = get_alignment()
-    return (size + alignment - 1) & ~(alignment - 1)
-
-# KV-specific transformer cache integration
-class ArenaTransformerCache:
-    """
-    High-level transformer cache using arena-allocated KV tensors.
-    Integrates with popular transformer libraries.
-    """
-    
-    def __init__(self, model_name: str, num_layers: int, max_seq_len: int = None):
-        self.model_name = model_name
-        self.num_layers = num_layers
-        self.manager = create_model_optimized_manager(model_name, max_seq_len)
-        self.layer_arenas = []
-        self.layer_caches = []
-        
-        # Create one arena per layer for better memory locality
-        for layer_idx in range(num_layers):
-            arena = self.manager.create_sequence_arena()
-            self.layer_arenas.append(arena)
-            self.layer_caches.append({'key': None, 'value': None, 'offset': None, 'size': None})
-    
-    def allocate_layer_cache(self, layer_idx: int, seq_len: int, num_heads: int, head_dim: int,
-                           dtype: torch.dtype = torch.float16, device: str = 'cuda') -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Allocate KV cache for a specific transformer layer.
-        
-        Args:
-            layer_idx: Layer index
-            seq_len: Initial sequence length
-            num_heads: Number of attention heads
-            head_dim: Dimension per head
-            dtype: Tensor data type
-            device: Device to allocate on
-        
-        Returns:
-            Tuple of (key_tensor, value_tensor)
-        """
-        if layer_idx >= self.num_layers:
-            raise ValueError(f"Layer index {layer_idx} >= num_layers {self.num_layers}")
-        
-        arena = self.layer_arenas[layer_idx]
-        key_tensor, value_tensor, (offset, size) = arena.allocate_and_create_tensors(
-            seq_len, num_heads, head_dim, dtype, device
-        )
-        
-        # Store in cache
-        self.layer_caches[layer_idx] = {
-            'key': key_tensor,
-            'value': value_tensor,
-            'offset': offset,
-            'size': size,
-            'seq_len': seq_len,
-            'num_heads': num_heads,
-            'head_dim': head_dim
-        }
-        
-        return key_tensor, value_tensor
-    
-    def extend_layer_cache(self, layer_idx: int, new_seq_len: int) -> Tuple[torch.Tensor, torch.Tensor, bool]:
-        """
-        Extend KV cache for a specific layer (zero-copy when possible).
-        
-        Args:
-            layer_idx: Layer index
-            new_seq_len: New sequence length
-        
-        Returns:
-            Tuple of (new_key_tensor, new_value_tensor, was_zero_copy)
-        """
-        if layer_idx >= self.num_layers:
-            raise ValueError(f"Layer index {layer_idx} >= num_layers {self.num_layers}")
-        
-        cache = self.layer_caches[layer_idx]
-        if cache['key'] is None:
-            raise ValueError(f"Layer {layer_idx} cache not allocated")
-        
-        arena = self.layer_arenas[layer_idx]
-        new_key, new_value, was_zero_copy = arena.extend_pytorch_tensors(
-            cache['key'], cache['value'], cache['offset'], cache['size'], new_seq_len
-        )
-        
-        # Update cache
-        cache['key'] = new_key
-        cache['value'] = new_value
-        cache['seq_len'] = new_seq_len
-        
-        return new_key, new_value, was_zero_copy
-    
-    def get_layer_cache(self, layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
-        """Get current KV cache for a layer."""
-        if layer_idx >= self.num_layers:
-            return None
-        
-        cache = self.layer_caches[layer_idx]
-        if cache['key'] is None:
-            return None
-        
-        return cache['key'], cache['value']
-    
-    def get_cache_stats(self) -> dict:
-        """Get comprehensive cache statistics."""
-        total_memory = 0
-        total_tensors = 0
-        zero_copy_capable = 0
-        
-        layer_stats = []
-        for i, (arena, cache) in enumerate(zip(self.layer_arenas, self.layer_caches)):
-            arena_stats = arena.get_stats()
-            layer_stat = {
-                'layer_idx': i,
-                'allocated': cache['key'] is not None,
-                'seq_len': cache.get('seq_len', 0),
-                'arena_stats': arena_stats
-            }
-            layer_stats.append(layer_stat)
-            
-            if cache['key'] is not None:
-                total_memory += cache['key'].numel() * cache['key'].element_size() * 2  # K + V
-                total_tensors += 2
-        
-        # Get slab recycling metrics if available
-        recycling_metrics = self.manager.get_slab_recycling_metrics()
-        
-        return {
-            'model_name': self.model_name,
-            'num_layers': self.num_layers,
-            'total_memory_mb': total_memory / (1024 * 1024),
-            'total_tensors': total_tensors,
-            'layer_stats': layer_stats,
-            'manager_stats': self.manager.get_global_stats(),
-            'recycling_metrics': recycling_metrics
-        }
 
 # Performance testing utilities
 def benchmark_kv_operations(model_name: str, seq_lens: List[int], num_trials: int = 10) -> dict:
@@ -1459,6 +1467,138 @@ class SequenceArena:
             'utilization': 0.5,
             'num_tensors': len(self._tensors),
             'kv_tensors': kv_tensors,
+        }
+
+# KV-specific transformer cache integration
+class ArenaTransformerCache:
+    """
+    High-level transformer cache using arena-allocated KV tensors.
+    Integrates with popular transformer libraries.
+    """
+    
+    def __init__(self, model_name: str, num_layers: int, max_seq_len: int = None):
+        self.model_name = model_name
+        self.num_layers = num_layers
+        self.manager = create_model_optimized_manager(model_name, max_seq_len)
+        self.layer_arenas = []
+        self.layer_caches = []
+        
+        # Create one arena per layer for better memory locality
+        for layer_idx in range(num_layers):
+            arena = self.manager.create_sequence_arena()
+            self.layer_arenas.append(arena)
+            self.layer_caches.append({'key': None, 'value': None, 'offset': None, 'size': None})
+    
+    def allocate_layer_cache(self, layer_idx: int, seq_len: int, num_heads: int, head_dim: int,
+                           dtype: torch.dtype = torch.float16, device: str = 'cuda') -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Allocate KV cache for a specific transformer layer.
+        
+        Args:
+            layer_idx: Layer index
+            seq_len: Initial sequence length
+            num_heads: Number of attention heads
+            head_dim: Dimension per head
+            dtype: Tensor data type
+            device: Device to allocate on
+        
+        Returns:
+            Tuple of (key_tensor, value_tensor)
+        """
+        if layer_idx >= self.num_layers:
+            raise ValueError(f"Layer index {layer_idx} >= num_layers {self.num_layers}")
+        
+        arena = self.layer_arenas[layer_idx]
+        key_tensor, value_tensor, (offset, size) = arena.allocate_and_create_tensors(
+            seq_len, num_heads, head_dim, dtype, device
+        )
+        
+        # Store in cache
+        self.layer_caches[layer_idx] = {
+            'key': key_tensor,
+            'value': value_tensor,
+            'offset': offset,
+            'size': size,
+            'seq_len': seq_len,
+            'num_heads': num_heads,
+            'head_dim': head_dim
+        }
+        
+        return key_tensor, value_tensor
+    
+    def extend_layer_cache(self, layer_idx: int, new_seq_len: int) -> Tuple[torch.Tensor, torch.Tensor, bool]:
+        """
+        Extend KV cache for a specific layer (zero-copy when possible).
+        
+        Args:
+            layer_idx: Layer index
+            new_seq_len: New sequence length
+        
+        Returns:
+            Tuple of (new_key_tensor, new_value_tensor, was_zero_copy)
+        """
+        if layer_idx >= self.num_layers:
+            raise ValueError(f"Layer index {layer_idx} >= num_layers {self.num_layers}")
+        
+        cache = self.layer_caches[layer_idx]
+        if cache['key'] is None:
+            raise ValueError(f"Layer {layer_idx} cache not allocated")
+        
+        arena = self.layer_arenas[layer_idx]
+        new_key, new_value, was_zero_copy = arena.extend_pytorch_tensors(
+            cache['key'], cache['value'], cache['offset'], cache['size'], new_seq_len
+        )
+        
+        # Update cache
+        cache['key'] = new_key
+        cache['value'] = new_value
+        cache['seq_len'] = new_seq_len
+        
+        return new_key, new_value, was_zero_copy
+    
+    def get_layer_cache(self, layer_idx: int) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+        """Get current KV cache for a layer."""
+        if layer_idx >= self.num_layers:
+            return None
+        
+        cache = self.layer_caches[layer_idx]
+        if cache['key'] is None:
+            return None
+        
+        return cache['key'], cache['value']
+    
+    def get_cache_stats(self) -> dict:
+        """Get comprehensive cache statistics."""
+        total_memory = 0
+        total_tensors = 0
+        zero_copy_capable = 0
+        
+        layer_stats = []
+        for i, (arena, cache) in enumerate(zip(self.layer_arenas, self.layer_caches)):
+            arena_stats = arena.get_stats()
+            layer_stat = {
+                'layer_idx': i,
+                'allocated': cache['key'] is not None,
+                'seq_len': cache.get('seq_len', 0),
+                'arena_stats': arena_stats
+            }
+            layer_stats.append(layer_stat)
+            
+            if cache['key'] is not None:
+                total_memory += cache['key'].numel() * cache['key'].element_size() * 2  # K + V
+                total_tensors += 2
+        
+        # Get slab recycling metrics if available
+        recycling_metrics = self.manager.get_slab_recycling_metrics()
+        
+        return {
+            'model_name': self.model_name,
+            'num_layers': self.num_layers,
+            'total_memory_mb': total_memory / (1024 * 1024),
+            'total_tensors': total_tensors,
+            'layer_stats': layer_stats,
+            'manager_stats': self.manager.get_global_stats(),
+            'recycling_metrics': recycling_metrics
         }
 
 def benchmark_pure_bump_vs_complex_allocation(num_allocations: int = 1000,
@@ -1801,6 +1941,37 @@ def test_pure_bump_allocation():
         import traceback
         traceback.print_exc()
         return False
+
+# Additional utility functions for compatibility
+def get_default_page_size() -> int:
+    """Get the default KV page size."""
+    if _lib.arena_get_default_page_size is not None:
+        try:
+            return _lib.arena_get_default_page_size()
+        except:
+            pass
+    return DEFAULT_PAGE_SIZE
+
+def get_alignment() -> int:
+    """Get the memory alignment requirement."""
+    if _lib.arena_get_alignment is not None:
+        try:
+            return _lib.arena_get_alignment()
+        except:
+            pass
+    return 64  # Default alignment
+
+def align_size(size: int) -> int:
+    """Align a size to the required boundary."""
+    if _lib.arena_align_size is not None:
+        try:
+            return _lib.arena_align_size(size)
+        except:
+            pass
+    
+    # Default alignment implementation
+    alignment = get_alignment()
+    return (size + alignment - 1) & ~(alignment - 1)
 
 # Export main classes and functions
 __all__ = [

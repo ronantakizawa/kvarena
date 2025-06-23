@@ -1,6 +1,7 @@
 INFO:arena_kv_cache_bindings:CUDA available with 1 device(s)
 INFO:arena_kv_cache_bindings:Successfully loaded library: ./libarena_kv_cache.so
 INFO:arena_kv_cache_bindings:All function signatures configured successfully
+WARNING:arena_kv_cache_bindings:Some slab recycling functions not available: ./libarena_kv_cache.so: undefined symbol: prod_get_slab_recycling_stats
 ✅ Successfully imported enhanced arena bindings
 🧪 ARENA KV-CACHE TEST SUITE
 ==================================================
@@ -13,19 +14,23 @@ CUDA Memory: 14.7 GB
 🔍 Running: Basic Allocation & Tensor Creation
 ------------------------------
 🔧 Testing basic allocation...
-INFO:arena_kv_cache_bindings:Optimized page size: 1536KB for model config: {'hidden_size': 512, 'num_heads': 8, 'typical_seq_len': 128}
+INFO:arena_kv_cache_bindings:KV-optimized page size: 2048KB for model config: {'hidden_size': 512, 'num_heads': 8, 'typical_seq_len': 128}
+INFO:arena_kv_cache_bindings:  - Largest KV tensor: 1024KB
+INFO:arena_kv_cache_bindings:  - Max sequence length: 512
+INFO:arena_kv_cache_bindings:  - Heads: 8x64
+INFO:arena_kv_cache_bindings:Created ArenaKVCacheManager with KV-optimized page_size=2048KB
+INFO:arena_kv_cache_bindings:CUDA device: Tesla T4
+✓ Created optimized manager
+✓ Created sequence arena
+✓ Allocated tensor: offset=1, size=262144
+✓ Created PyTorch tensors on CPU: key=torch.Size([64, 8, 64]), value=torch.Size([64, 8, 64])
+✓ Successfully moved tensors to cuda:0
+✓ Final tensors on device: cuda:0
+✓ Tensor operations work correctly
+✓ Arena stats: 16777216 bytes, 2 tensors
+✅ Basic Allocation PASSED
 
-T4 GPU Detection: Perfect - Tesla T4 with 15.8GB memory detected
-CUDA Runtime: All symbols properly linked and functional
-Memory Management: 100% success rate on allocations up to 7.5GB
-Arena Operations: Zero-copy extensions at 100% efficiency
-Stress Testing: 100% allocation success rate, excellent memory recovery (99.9%)
-KV-Cache Patterns: All working correctly with proper utilization
-
-⚠️ Memory Bandwidth Issue (Not Critical):
-
-Observed: ~3 GB/s instead of expected ~300 GB/s
-Cause: This is likely PCIe host-to-device transfer bandwidth, not GPU memory bandwidth
-Impact: None for your use case - arena operations happen entirely on GPU
-
-Your code is designed to work with ANY CUDA-capable GPU, not just T4! 
+🔍 Running: CUDA Integration
+------------------------------
+🚀 Testing CUDA integration...
+malloc(): unaligned tcache chunk detected
