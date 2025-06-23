@@ -2,6 +2,7 @@
 """
 Enhanced Python bindings for Arena KV-Cache with pure bump allocation and TRUE zero-copy extensions.
 This implements the pure bump allocation approach from the Rust implementation.
+Now includes lock-free slab recycling support.
 """
 
 import ctypes
@@ -73,6 +74,48 @@ ARENA_SUCCESS = 0
 ARENA_ERROR_ALLOC = -1
 ARENA_ERROR_INVALID_PARAM = -2
 DEFAULT_PAGE_SIZE = 256 * 1024  # 256 KiB - matches project spec example
+
+# Add new FFI function signatures for slab recycling
+def _setup_slab_recycling_signatures():
+    """Setup function signatures for slab recycling operations."""
+    try:
+        # Slab recycling stats
+        _lib.prod_get_slab_recycling_stats.argtypes = [
+            ctypes.c_void_p,  # manager
+            ctypes.POINTER(ctypes.c_size_t),  # pages_created_out
+            ctypes.POINTER(ctypes.c_size_t),  # pages_recycled_out
+            ctypes.POINTER(ctypes.c_size_t),  # pages_reused_out
+            ctypes.POINTER(ctypes.c_double),  # recycling_efficiency_out
+            ctypes.POINTER(ctypes.c_double),  # reuse_efficiency_out
+            ctypes.POINTER(ctypes.c_size_t),  # bytes_saved_mb_out
+            ctypes.POINTER(ctypes.c_double),  # fragmentation_prevented_out
+            ctypes.POINTER(ctypes.c_size_t),  # gc_stalls_avoided_out
+        ]
+        _lib.prod_get_slab_recycling_stats.restype = ctypes.c_int
+        
+        # Slab pool cleanup
+        _lib.prod_cleanup_slab_pools.argtypes = [
+            ctypes.c_void_p,  # manager
+            ctypes.POINTER(ctypes.c_size_t),  # pages_cleaned_out
+            ctypes.POINTER(ctypes.c_double),  # cleanup_time_ms_out
+            ctypes.POINTER(ctypes.c_size_t),  # memory_freed_mb_out
+        ]
+        _lib.prod_cleanup_slab_pools.restype = ctypes.c_int
+        
+        # Lock-free verification
+        _lib.prod_verify_lock_free_recycling.argtypes = [
+            ctypes.c_void_p,  # manager
+            ctypes.c_size_t,  # test_allocations
+            ctypes.POINTER(ctypes.c_int),     # recycling_working_out
+            ctypes.POINTER(ctypes.c_int),     # lock_free_confirmed_out
+            ctypes.POINTER(ctypes.c_double),  # performance_gain_out
+        ]
+        _lib.prod_verify_lock_free_recycling.restype = ctypes.c_int
+        
+        logger.info("Slab recycling function signatures configured")
+        
+    except AttributeError as e:
+        logger.warning(f"Some slab recycling functions not available: {e}")
 
 # Function signatures with error handling
 def _setup_function_signatures():
@@ -227,6 +270,45 @@ def _setup_function_signatures():
 
 # Setup function signatures
 _setup_function_signatures()
+
+# Call this after main function setup
+_setup_slab_recycling_signatures()
+
+class SlabRecyclingMetrics:
+    """Metrics for lock-free slab recycling performance."""
+    
+    def __init__(self, pages_created: int, pages_recycled: int, pages_reused: int,
+                 recycling_efficiency: float, reuse_efficiency: float, 
+                 bytes_saved_mb: int, fragmentation_prevented: float, 
+                 gc_stalls_avoided: int, pool_sizes: List[int]):
+        self.pages_created = pages_created
+        self.pages_recycled = pages_recycled  
+        self.pages_reused = pages_reused
+        self.recycling_efficiency = recycling_efficiency
+        self.reuse_efficiency = reuse_efficiency
+        self.bytes_saved_mb = bytes_saved_mb
+        self.fragmentation_prevented = fragmentation_prevented
+        self.gc_stalls_avoided = gc_stalls_avoided
+        self.pool_sizes = pool_sizes
+    
+    def __str__(self) -> str:
+        return f"""SlabRecyclingMetrics:
+  Pages: {self.pages_created} created, {self.pages_recycled} recycled, {self.pages_reused} reused
+  Efficiency: {self.recycling_efficiency:.1%} recycling, {self.reuse_efficiency:.1%} reuse
+  Savings: {self.bytes_saved_mb}MB memory, {self.fragmentation_prevented:.1%} fragmentation prevented
+  Performance: {self.gc_stalls_avoided} GC stalls avoided
+  Pool sizes: {self.pool_sizes}"""
+
+class SlabCleanupReport:
+    """Report from slab pool cleanup operations."""
+    
+    def __init__(self, pages_cleaned: int, cleanup_time_ms: float, memory_freed_mb: int):
+        self.pages_cleaned = pages_cleaned
+        self.cleanup_time_ms = cleanup_time_ms
+        self.memory_freed_mb = memory_freed_mb
+    
+    def __str__(self) -> str:
+        return f"SlabCleanup: {self.pages_cleaned} pages in {self.cleanup_time_ms:.2f}ms, ~{self.memory_freed_mb}MB freed"
 
 class ArenaError(Exception):
     """Exception raised for arena allocation errors."""
@@ -497,7 +579,7 @@ class PureBumpArena:
         logger.debug("Reset pure bump allocator")
 
 class ArenaKVCacheManager:
-    """Enhanced KV cache manager with CUDA optimizations and KV-specific page sizing."""
+    """Enhanced KV cache manager with CUDA optimizations, KV-specific page sizing, and lock-free slab recycling."""
     
     def __init__(self, page_size: Optional[int] = None, model_name: Optional[str] = None):
         # KV-specific page size optimization
@@ -550,6 +632,136 @@ class ArenaKVCacheManager:
                 _lib.kv_cache_manager_free(self._ptr)
             except:
                 pass  # Ignore errors during cleanup
+    
+    def get_slab_recycling_metrics(self) -> SlabRecyclingMetrics:
+        """Get comprehensive slab recycling metrics."""
+        if not hasattr(_lib, 'prod_get_slab_recycling_stats'):
+            logger.warning("Slab recycling stats not available")
+            return SlabRecyclingMetrics(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, [0, 0, 0, 0])
+        
+        pages_created = ctypes.c_size_t()
+        pages_recycled = ctypes.c_size_t()
+        pages_reused = ctypes.c_size_t()
+        recycling_efficiency = ctypes.c_double()
+        reuse_efficiency = ctypes.c_double()
+        bytes_saved_mb = ctypes.c_size_t()
+        fragmentation_prevented = ctypes.c_double()
+        gc_stalls_avoided = ctypes.c_size_t()
+        
+        try:
+            result = _lib.prod_get_slab_recycling_stats(
+                self._ptr,
+                ctypes.byref(pages_created),
+                ctypes.byref(pages_recycled),
+                ctypes.byref(pages_reused),
+                ctypes.byref(recycling_efficiency),
+                ctypes.byref(reuse_efficiency),
+                ctypes.byref(bytes_saved_mb),
+                ctypes.byref(fragmentation_prevented),
+                ctypes.byref(gc_stalls_avoided)
+            )
+            
+            if result != ARENA_SUCCESS:
+                logger.warning(f"Failed to get slab recycling stats: error {result}")
+                return SlabRecyclingMetrics(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, [0, 0, 0, 0])
+            
+            # Estimate pool sizes (not directly available from this call)
+            pool_sizes = [0, 0, 0, 0]  # Would need separate call for exact sizes
+            
+            return SlabRecyclingMetrics(
+                pages_created.value,
+                pages_recycled.value,
+                pages_reused.value,
+                recycling_efficiency.value,
+                reuse_efficiency.value,
+                bytes_saved_mb.value,
+                fragmentation_prevented.value,
+                gc_stalls_avoided.value,
+                pool_sizes
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to get slab recycling metrics: {e}")
+            return SlabRecyclingMetrics(0, 0, 0, 0.0, 0.0, 0, 0.0, 0, [0, 0, 0, 0])
+    
+    def cleanup_slab_pools(self) -> SlabCleanupReport:
+        """Cleanup slab pools and return report."""
+        if not hasattr(_lib, 'prod_cleanup_slab_pools'):
+            logger.warning("Slab pool cleanup not available")
+            return SlabCleanupReport(0, 0.0, 0)
+        
+        pages_cleaned = ctypes.c_size_t()
+        cleanup_time_ms = ctypes.c_double()
+        memory_freed_mb = ctypes.c_size_t()
+        
+        try:
+            result = _lib.prod_cleanup_slab_pools(
+                self._ptr,
+                ctypes.byref(pages_cleaned),
+                ctypes.byref(cleanup_time_ms),
+                ctypes.byref(memory_freed_mb)
+            )
+            
+            if result != ARENA_SUCCESS:
+                logger.warning(f"Failed to cleanup slab pools: error {result}")
+                return SlabCleanupReport(0, 0.0, 0)
+            
+            report = SlabCleanupReport(
+                pages_cleaned.value,
+                cleanup_time_ms.value,
+                memory_freed_mb.value
+            )
+            
+            logger.info(f"Slab cleanup completed: {report}")
+            return report
+            
+        except Exception as e:
+            logger.error(f"Failed to cleanup slab pools: {e}")
+            return SlabCleanupReport(0, 0.0, 0)
+    
+    def verify_lock_free_recycling(self, test_allocations: int = 1000) -> Tuple[bool, bool, float]:
+        """
+        Verify that lock-free recycling is working correctly.
+        
+        Args:
+            test_allocations: Number of test allocations to perform
+            
+        Returns:
+            Tuple of (recycling_working, lock_free_confirmed, performance_gain)
+        """
+        if not hasattr(_lib, 'prod_verify_lock_free_recycling'):
+            logger.warning("Lock-free recycling verification not available")
+            return False, False, 0.0
+        
+        recycling_working = ctypes.c_int()
+        lock_free_confirmed = ctypes.c_int()
+        performance_gain = ctypes.c_double()
+        
+        try:
+            result = _lib.prod_verify_lock_free_recycling(
+                self._ptr,
+                test_allocations,
+                ctypes.byref(recycling_working),
+                ctypes.byref(lock_free_confirmed),
+                ctypes.byref(performance_gain)
+            )
+            
+            if result != ARENA_SUCCESS:
+                logger.warning(f"Failed to verify lock-free recycling: error {result}")
+                return False, False, 0.0
+            
+            is_recycling_working = bool(recycling_working.value)
+            is_lock_free = bool(lock_free_confirmed.value)
+            perf_gain = performance_gain.value
+            
+            logger.info(f"Lock-free recycling verification: recycling={is_recycling_working}, "
+                       f"lock_free={is_lock_free}, performance_gain={perf_gain:.2f}x")
+            
+            return is_recycling_working, is_lock_free, perf_gain
+            
+        except Exception as e:
+            logger.error(f"Failed to verify lock-free recycling: {e}")
+            return False, False, 0.0
     
     def create_sequence_arena(self):
         """Create a new sequence arena optimized for KV tensors."""
@@ -938,13 +1150,17 @@ class ArenaTransformerCache:
                 total_memory += cache['key'].numel() * cache['key'].element_size() * 2  # K + V
                 total_tensors += 2
         
+        # Get slab recycling metrics if available
+        recycling_metrics = self.manager.get_slab_recycling_metrics()
+        
         return {
             'model_name': self.model_name,
             'num_layers': self.num_layers,
             'total_memory_mb': total_memory / (1024 * 1024),
             'total_tensors': total_tensors,
             'layer_stats': layer_stats,
-            'manager_stats': self.manager.get_global_stats()
+            'manager_stats': self.manager.get_global_stats(),
+            'recycling_metrics': recycling_metrics
         }
 
 # Performance testing utilities
@@ -965,7 +1181,8 @@ def benchmark_kv_operations(model_name: str, seq_lens: List[int], num_trials: in
         'allocation_times': {},
         'extension_times': {},
         'zero_copy_rates': {},
-        'memory_usage': {}
+        'memory_usage': {},
+        'recycling_metrics': {}
     }
     
     for seq_len in seq_lens:
@@ -973,10 +1190,11 @@ def benchmark_kv_operations(model_name: str, seq_lens: List[int], num_trials: in
         
         # Allocation benchmark
         alloc_times = []
+        manager = create_model_optimized_manager(model_name)
+        
         for trial in range(num_trials):
             start_time = time.time()
             
-            manager = create_model_optimized_manager(model_name)
             arena = manager.create_sequence_arena()
             
             # Use model-appropriate head configuration
@@ -1002,7 +1220,6 @@ def benchmark_kv_operations(model_name: str, seq_lens: List[int], num_trials: in
         }
         
         # Extension benchmark
-        manager = create_model_optimized_manager(model_name)
         arena = manager.create_sequence_arena()
         key, value, (offset, size) = arena.allocate_and_create_tensors(seq_len, num_heads, head_dim)
         
@@ -1036,31 +1253,17 @@ def benchmark_kv_operations(model_name: str, seq_lens: List[int], num_trials: in
         # Memory usage estimation
         memory_info = estimate_kv_memory_usage(seq_len, num_heads, head_dim)
         results['memory_usage'][seq_len] = memory_info
+        
+        # Slab recycling metrics
+        recycling_metrics = manager.get_slab_recycling_metrics()
+        results['recycling_metrics'][seq_len] = {
+            'pages_recycled': recycling_metrics.pages_recycled,
+            'recycling_efficiency': recycling_metrics.recycling_efficiency,
+            'bytes_saved_mb': recycling_metrics.bytes_saved_mb,
+            'gc_stalls_avoided': recycling_metrics.gc_stalls_avoided
+        }
     
     return results
-
-# Export main classes and functions
-__all__ = [
-    'PureBumpArena',
-    'ArenaKVCacheManager',
-    'SequenceArena', 
-    'ArenaTransformerCache',
-    'ArenaError',
-    'create_optimized_manager',
-    'create_model_optimized_manager',
-    'benchmark_pure_bump_vs_complex_allocation', 
-    'benchmark_zero_copy_extension_performance',
-    'test_pure_bump_allocation',
-    'calculate_kv_page_size',
-    'calculate_model_page_size',
-    'estimate_kv_memory_usage',
-    'get_kv_recommendations',
-    'benchmark_kv_operations',
-    'CUDA_AVAILABLE',
-    'get_default_page_size',
-    'get_alignment',
-    'align_size'
-]
 
 class SequenceArena:
     """Enhanced sequence arena with KV-specific PyTorch tensor creation."""
@@ -1562,17 +1765,32 @@ def test_pure_bump_allocation():
         print(f"  🗑️  Fragmentation: {final_stats['fragmentation']:.1%}")
         print(f"  📏 Available space: {final_stats['available_space']//1024}KB")
         
+        # Test 7: Slab recycling metrics
+        print("\n7️⃣ Testing slab recycling...")
+        
+        recycling_metrics = manager.get_slab_recycling_metrics()
+        print(f"  ♻️  Recycling efficiency: {recycling_metrics.recycling_efficiency:.1%}")
+        print(f"  💾 Memory saved: {recycling_metrics.bytes_saved_mb}MB")
+        print(f"  ⚡ GC stalls avoided: {recycling_metrics.gc_stalls_avoided}")
+        
+        # Test lock-free verification
+        is_recycling, is_lock_free, perf_gain = manager.verify_lock_free_recycling(500)
+        print(f"  🔒 Lock-free confirmed: {is_lock_free}")
+        print(f"  📈 Performance gain: {perf_gain:.2f}x")
+        
         # Summary
-        print("\n✅ Pure Bump Allocation Test Results:")
+        print("\n✅ Pure Bump Allocation with Slab Recycling Test Results:")
         print(f"   • Basic allocation: ✓ Working")
         print(f"   • KV tensor creation: ✓ Working")  
         print(f"   • Zero-copy extensions: {zero_copy_rate:.1%} success rate")
         print(f"   • Performance improvement: {benchmark_results['speedup']:.2f}x faster")
         print(f"   • Memory efficiency: {final_stats['utilization']:.1%} utilization")
+        print(f"   • Slab recycling: {recycling_metrics.recycling_efficiency:.1%} efficiency")
+        print(f"   • Lock-free operation: {is_lock_free}")
         
         if (zero_copy_rate > 0.8 and benchmark_results['speedup'] > 1.5 and 
-            final_stats['utilization'] > 0.3):
-            print("\n🎉 Pure bump allocation is working optimally!")
+            final_stats['utilization'] > 0.3 and recycling_metrics.recycling_efficiency > 0.5):
+            print("\n🎉 Pure bump allocation with slab recycling is working optimally!")
             return True
         else:
             print("\n⚠️  Pure bump allocation working but could be optimized")
@@ -1589,11 +1807,22 @@ __all__ = [
     'PureBumpArena',
     'ArenaKVCacheManager',
     'SequenceArena', 
+    'ArenaTransformerCache',
     'ArenaError',
+    'SlabRecyclingMetrics',
+    'SlabCleanupReport',
+    'create_optimized_manager',
+    'create_model_optimized_manager',
     'benchmark_pure_bump_vs_complex_allocation', 
     'benchmark_zero_copy_extension_performance',
     'test_pure_bump_allocation',
     'calculate_kv_page_size',
     'calculate_model_page_size',
+    'estimate_kv_memory_usage',
+    'get_kv_recommendations',
+    'benchmark_kv_operations',
     'CUDA_AVAILABLE',
+    'get_default_page_size',
+    'get_alignment',
+    'align_size'
 ]

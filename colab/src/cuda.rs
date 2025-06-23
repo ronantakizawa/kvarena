@@ -1,4 +1,4 @@
-// src/cuda.rs - Complete fixed CUDA integration with runtime verification
+// src/cuda.rs - Complete fixed CUDA integration with runtime verification - ALL PUBLIC
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -11,141 +11,141 @@ use std::sync::Mutex;
 #[link(name = "cudart")]
 extern "C" {
     // Device management
-    fn cudaSetDevice(device: i32) -> i32;
-    fn cudaGetDevice(device: *mut i32) -> i32;
-    fn cudaGetDeviceCount(count: *mut i32) -> i32;
-    fn cudaDeviceReset() -> i32;
-    fn cudaDeviceSynchronize() -> i32;
+    pub fn cudaSetDevice(device: i32) -> i32;
+    pub fn cudaGetDevice(device: *mut i32) -> i32;
+    pub fn cudaGetDeviceCount(count: *mut i32) -> i32;
+    pub fn cudaDeviceReset() -> i32;
+    pub fn cudaDeviceSynchronize() -> i32;
     
     // Memory management - REAL CUDA memory operations
-    fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> i32;
-    fn cudaFree(devPtr: *mut c_void) -> i32;
-    fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
-    fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
-    fn cudaMemset(devPtr: *mut c_void, value: i32, count: usize) -> i32;
-    fn cudaMemsetAsync(devPtr: *mut c_void, value: i32, count: usize, stream: *mut c_void) -> i32;
+    pub fn cudaMalloc(devPtr: *mut *mut c_void, size: usize) -> i32;
+    pub fn cudaFree(devPtr: *mut c_void) -> i32;
+    pub fn cudaMemcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> i32;
+    pub fn cudaMemcpyAsync(dst: *mut c_void, src: *const c_void, count: usize, kind: i32, stream: *mut c_void) -> i32;
+    pub fn cudaMemset(devPtr: *mut c_void, value: i32, count: usize) -> i32;
+    pub fn cudaMemsetAsync(devPtr: *mut c_void, value: i32, count: usize, stream: *mut c_void) -> i32;
     
     // Memory info
-    fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
+    pub fn cudaMemGetInfo(free: *mut usize, total: *mut usize) -> i32;
     
     // Stream management
-    fn cudaStreamCreate(stream: *mut *mut c_void) -> i32;
-    fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> i32;
-    fn cudaStreamDestroy(stream: *mut c_void) -> i32;
-    fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
-    fn cudaStreamQuery(stream: *mut c_void) -> i32;
+    pub fn cudaStreamCreate(stream: *mut *mut c_void) -> i32;
+    pub fn cudaStreamCreateWithFlags(stream: *mut *mut c_void, flags: u32) -> i32;
+    pub fn cudaStreamDestroy(stream: *mut c_void) -> i32;
+    pub fn cudaStreamSynchronize(stream: *mut c_void) -> i32;
+    pub fn cudaStreamQuery(stream: *mut c_void) -> i32;
     
     // Error handling
-    fn cudaGetLastError() -> i32;
-    fn cudaGetErrorString(error: i32) -> *const i8;
+    pub fn cudaGetLastError() -> i32;
+    pub fn cudaGetErrorString(error: i32) -> *const i8;
     
     // Device properties
-    fn cudaGetDeviceProperties(prop: *mut CudaDeviceProperties, device: i32) -> i32;
-    fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
+    pub fn cudaGetDeviceProperties(prop: *mut CudaDeviceProperties, device: i32) -> i32;
+    pub fn cudaDeviceGetAttribute(value: *mut i32, attr: i32, device: i32) -> i32;
 }
 
-// CUDA constants
-const CUDA_SUCCESS: i32 = 0;
-const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
-const CUDA_ERROR_NOT_INITIALIZED: i32 = 3;
-const CUDA_ERROR_INVALID_DEVICE: i32 = 10;
-const CUDA_ERROR_INVALID_VALUE: i32 = 11;
-const CUDA_ERROR_NOT_READY: i32 = 600;
+// CUDA constants - ALL PUBLIC
+pub const CUDA_SUCCESS: i32 = 0;
+pub const CUDA_ERROR_OUT_OF_MEMORY: i32 = 2;
+pub const CUDA_ERROR_NOT_INITIALIZED: i32 = 3;
+pub const CUDA_ERROR_INVALID_DEVICE: i32 = 10;
+pub const CUDA_ERROR_INVALID_VALUE: i32 = 11;
+pub const CUDA_ERROR_NOT_READY: i32 = 600;
 
-const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
-const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
-const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
+pub const CUDA_MEMCPY_HOST_TO_DEVICE: i32 = 1;
+pub const CUDA_MEMCPY_DEVICE_TO_HOST: i32 = 2;
+pub const CUDA_MEMCPY_DEVICE_TO_DEVICE: i32 = 3;
 
-const CUDA_STREAM_NON_BLOCKING: u32 = 0x01;
+pub const CUDA_STREAM_NON_BLOCKING: u32 = 0x01;
 
-// Device attributes
-const CUDA_DEVICE_ATTR_MEMORY_CLOCK_RATE: i32 = 36;
-const CUDA_DEVICE_ATTR_GLOBAL_MEMORY_BUS_WIDTH: i32 = 37;
-const CUDA_DEVICE_ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
-const CUDA_DEVICE_ATTR_MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
+// Device attributes - ALL PUBLIC
+pub const CUDA_DEVICE_ATTR_MEMORY_CLOCK_RATE: i32 = 36;
+pub const CUDA_DEVICE_ATTR_GLOBAL_MEMORY_BUS_WIDTH: i32 = 37;
+pub const CUDA_DEVICE_ATTR_MULTIPROCESSOR_COUNT: i32 = 16;
+pub const CUDA_DEVICE_ATTR_MAX_THREADS_PER_MULTIPROCESSOR: i32 = 39;
 
 #[repr(C)]
-struct CudaDeviceProperties {
-    name: [i8; 256],
-    uuid: [u8; 16],  // Changed from i8 to u8
-    luid: [i8; 8],   // Added missing field
-    luid_device_node_mask: u32, // Added missing field
-    total_global_mem: usize,
-    shared_mem_per_block: usize,
-    regs_per_block: i32,
-    warp_size: i32,
-    mem_pitch: usize,
-    max_threads_per_block: i32,
-    max_threads_dim: [i32; 3],
-    max_grid_size: [i32; 3],
-    clock_rate: i32,
-    total_const_mem: usize,
-    major: i32,
-    minor: i32,
-    texture_alignment: usize,
-    texture_pitch_alignment: usize,
-    device_overlap: i32,
-    multiprocessor_count: i32,
-    kernel_exec_timeout_enabled: i32,
-    integrated: i32,
-    can_map_host_memory: i32,
-    compute_mode: i32,
-    max_texture_1d: i32,                    // Added missing fields
-    max_texture_1d_mipmap: i32,             // to match CUDA struct
-    max_texture_1d_linear: i32,
-    max_texture_2d: [i32; 2],
-    max_texture_2d_mipmap: [i32; 2],
-    max_texture_2d_linear: [i32; 3],
-    max_texture_2d_gather: [i32; 2],
-    max_texture_3d: [i32; 3],
-    max_texture_3d_alt: [i32; 3],
-    max_texture_cubemap: i32,
-    max_texture_1d_layered: [i32; 2],
-    max_texture_2d_layered: [i32; 3],
-    max_texture_cubemap_layered: [i32; 2],
-    max_surface_1d: i32,
-    max_surface_2d: [i32; 2],
-    max_surface_3d: [i32; 3],
-    max_surface_1d_layered: [i32; 2],
-    max_surface_2d_layered: [i32; 3],
-    max_surface_cubemap: i32,
-    max_surface_cubemap_layered: [i32; 2],
-    surface_alignment: usize,
-    concurrent_kernels: i32,
-    ecc_enabled: i32,
-    pci_bus_id: i32,
-    pci_device_id: i32,
-    pci_domain_id: i32,
-    tcc_driver: i32,
-    async_engine_count: i32,
-    unified_addressing: i32,
-    memory_clock_rate: i32,
-    memory_bus_width: i32,
-    l2_cache_size: i32,
-    persist_ing_l2_cache_max_size: i32,
-    max_threads_per_multiprocessor: i32,
-    stream_priorities_supported: i32,
-    global_l1_cache_supported: i32,
-    local_l1_cache_supported: i32,
-    shared_mem_per_multiprocessor: usize,
-    regs_per_multiprocessor: i32,
-    managed_memory: i32,
-    is_multi_gpu_board: i32,
-    multi_gpu_board_group_id: i32,
-    host_native_atomic_supported: i32,
-    single_to_double_precision_perf_ratio: i32,
-    pageable_memory_access: i32,
-    concurrent_managed_access: i32,
-    compute_preemption_supported: i32,
-    can_use_host_pointer_for_registered_mem: i32,
-    cooperative_launch: i32,
-    cooperative_multi_device_launch: i32,
-    shared_mem_per_block_optin: usize,
-    pageable_memory_access_uses_host_page_tables: i32,
-    direct_managed_mem_access_from_host: i32,
-    max_blocks_per_multiprocessor: i32,
-    access_policy_max_window_size: i32,
-    reserved_shared_mem_per_block: usize,
+pub struct CudaDeviceProperties {
+    pub name: [i8; 256],
+    pub uuid: [u8; 16],  // Changed from i8 to u8
+    pub luid: [i8; 8],   // Added missing field
+    pub luid_device_node_mask: u32, // Added missing field
+    pub total_global_mem: usize,
+    pub shared_mem_per_block: usize,
+    pub regs_per_block: i32,
+    pub warp_size: i32,
+    pub mem_pitch: usize,
+    pub max_threads_per_block: i32,
+    pub max_threads_dim: [i32; 3],
+    pub max_grid_size: [i32; 3],
+    pub clock_rate: i32,
+    pub total_const_mem: usize,
+    pub major: i32,
+    pub minor: i32,
+    pub texture_alignment: usize,
+    pub texture_pitch_alignment: usize,
+    pub device_overlap: i32,
+    pub multiprocessor_count: i32,
+    pub kernel_exec_timeout_enabled: i32,
+    pub integrated: i32,
+    pub can_map_host_memory: i32,
+    pub compute_mode: i32,
+    pub max_texture_1d: i32,                    // Added missing fields
+    pub max_texture_1d_mipmap: i32,             // to match CUDA struct
+    pub max_texture_1d_linear: i32,
+    pub max_texture_2d: [i32; 2],
+    pub max_texture_2d_mipmap: [i32; 2],
+    pub max_texture_2d_linear: [i32; 3],
+    pub max_texture_2d_gather: [i32; 2],
+    pub max_texture_3d: [i32; 3],
+    pub max_texture_3d_alt: [i32; 3],
+    pub max_texture_cubemap: i32,
+    pub max_texture_1d_layered: [i32; 2],
+    pub max_texture_2d_layered: [i32; 3],
+    pub max_texture_cubemap_layered: [i32; 2],
+    pub max_surface_1d: i32,
+    pub max_surface_2d: [i32; 2],
+    pub max_surface_3d: [i32; 3],
+    pub max_surface_1d_layered: [i32; 2],
+    pub max_surface_2d_layered: [i32; 3],
+    pub max_surface_cubemap: i32,
+    pub max_surface_cubemap_layered: [i32; 2],
+    pub surface_alignment: usize,
+    pub concurrent_kernels: i32,
+    pub ecc_enabled: i32,
+    pub pci_bus_id: i32,
+    pub pci_device_id: i32,
+    pub pci_domain_id: i32,
+    pub tcc_driver: i32,
+    pub async_engine_count: i32,
+    pub unified_addressing: i32,
+    pub memory_clock_rate: i32,
+    pub memory_bus_width: i32,
+    pub l2_cache_size: i32,
+    pub persist_ing_l2_cache_max_size: i32,
+    pub max_threads_per_multiprocessor: i32,
+    pub stream_priorities_supported: i32,
+    pub global_l1_cache_supported: i32,
+    pub local_l1_cache_supported: i32,
+    pub shared_mem_per_multiprocessor: usize,
+    pub regs_per_multiprocessor: i32,
+    pub managed_memory: i32,
+    pub is_multi_gpu_board: i32,
+    pub multi_gpu_board_group_id: i32,
+    pub host_native_atomic_supported: i32,
+    pub single_to_double_precision_perf_ratio: i32,
+    pub pageable_memory_access: i32,
+    pub concurrent_managed_access: i32,
+    pub compute_preemption_supported: i32,
+    pub can_use_host_pointer_for_registered_mem: i32,
+    pub cooperative_launch: i32,
+    pub cooperative_multi_device_launch: i32,
+    pub shared_mem_per_block_optin: usize,
+    pub pageable_memory_access_uses_host_page_tables: i32,
+    pub direct_managed_mem_access_from_host: i32,
+    pub max_blocks_per_multiprocessor: i32,
+    pub access_policy_max_window_size: i32,
+    pub reserved_shared_mem_per_block: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -181,7 +181,7 @@ impl std::fmt::Display for CudaError {
 
 impl std::error::Error for CudaError {}
 
-/// CRITICAL: Verify CUDA runtime is properly linked
+/// CRITICAL: Verify CUDA runtime is properly linked - NOW PUBLIC
 pub fn verify_cuda_runtime_linked() -> Result<(), String> {
     #[cfg(not(cuda_available))]
     {
@@ -234,7 +234,7 @@ pub fn verify_cuda_runtime_linked() -> Result<(), String> {
     }
 }
 
-/// CRITICAL: Runtime health check
+/// CRITICAL: Runtime health check - NOW PUBLIC
 pub fn cuda_runtime_health_check() {
     match verify_cuda_runtime_linked() {
         Ok(()) => {
@@ -254,7 +254,7 @@ pub fn cuda_runtime_health_check() {
     }
 }
 
-/// Check CUDA environment setup
+/// Check CUDA environment setup - NOW PUBLIC
 pub fn check_cuda_environment() -> Result<(), String> {
     // Check environment variables
     let cuda_vars = ["CUDA_PATH", "CUDA_ROOT", "CUDA_HOME"];
@@ -425,6 +425,11 @@ impl CudaStream {
             Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
         }
     }
+    
+    /// Get device ID for this stream - NOW PUBLIC
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
 }
 
 impl Drop for CudaStream {
@@ -579,6 +584,42 @@ impl BumpAllocator {
         }
     }
 
+    /// Copy data from device to host at offset (REAL CUDA memcpy) - NOW PUBLIC
+    pub fn copy_to_host(&self, offset: usize, host_data: *mut c_void, size: usize) -> Result<(), CudaError> {
+        if offset + size > self.page_size {
+            return Err(CudaError(CUDA_ERROR_INVALID_VALUE));
+        }
+
+        #[cfg(cuda_available)]
+        unsafe {
+            let result = cudaSetDevice(self.device_id);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            let src = self.device_ptr.as_ptr().add(offset) as *const c_void;
+            
+            let result = if let Some(stream) = &self.stream {
+                cudaMemcpyAsync(host_data, src, size, CUDA_MEMCPY_DEVICE_TO_HOST, stream.as_ptr())
+            } else {
+                cudaMemcpy(host_data, src, size, CUDA_MEMCPY_DEVICE_TO_HOST)
+            };
+
+            if result != CUDA_SUCCESS {
+                log::error!("CUDA memcpy failed: {} bytes from device offset {} to host", size, offset);
+                Err(CudaError(result))
+            } else {
+                log::trace!("CUDA memcpy: {} bytes from device offset {} to host", size, offset);
+                Ok(())
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+
     /// Zero-copy device-to-device move within page (REAL CUDA memcpy)
     pub fn device_to_device_copy(&self, src_offset: usize, dst_offset: usize, size: usize) -> Result<(), CudaError> {
         if src_offset + size > self.page_size || dst_offset + size > self.page_size {
@@ -679,6 +720,11 @@ impl BumpAllocator {
     pub fn device_id(&self) -> i32 { self.device_id }
     pub fn page_size(&self) -> usize { self.page_size }
     pub fn device_ptr(&self) -> *mut c_void { self.device_ptr.as_ptr() as *mut c_void }
+    
+    /// Get stream reference - NOW PUBLIC
+    pub fn stream(&self) -> Option<&Arc<CudaStream>> {
+        self.stream.as_ref()
+    }
 }
 
 impl Drop for BumpAllocator {
@@ -717,8 +763,8 @@ pub struct CudaPage {
     allocation_id: u64,
 }
 
-// Global allocation tracking
-static NEXT_ALLOCATION_ID: AtomicUsize = AtomicUsize::new(1);
+// Global allocation tracking - NOW PUBLIC
+pub static NEXT_ALLOCATION_ID: AtomicUsize = AtomicUsize::new(1);
 
 impl CudaPage {
     /// Create new CUDA page with real device memory
@@ -749,6 +795,11 @@ impl CudaPage {
         self.allocator.copy_from_host(offset, host_data, size)
     }
 
+    /// Copy from device to host - NOW PUBLIC
+    pub fn copy_to_host(&self, host_data: *mut c_void, size: usize, offset: usize) -> Result<(), CudaError> {
+        self.allocator.copy_to_host(offset, host_data, size)
+    }
+
     /// Zero-copy device-to-device copy
     pub fn copy_device_to_device(&self, src_offset: usize, dst_offset: usize, size: usize) -> Result<(), CudaError> {
         self.allocator.device_to_device_copy(src_offset, dst_offset, size)
@@ -772,6 +823,11 @@ impl CudaPage {
     pub fn available_space(&self) -> usize { self.allocator.available_space() }
     pub fn utilization(&self) -> f64 { self.allocator.utilization() }
     pub fn allocation_id(&self) -> u64 { self.allocation_id }
+    
+    /// Get allocator reference - NOW PUBLIC
+    pub fn allocator(&self) -> &BumpAllocator {
+        &self.allocator
+    }
     
     pub fn is_ready(&self) -> Result<bool, CudaError> { 
         // Check if any async operations are complete
@@ -891,6 +947,11 @@ impl CudaDeviceInfo {
         let bus_width_bytes = self.memory_bus_width as f64 / 8.0;
         (clock_hz * 2.0 * bus_width_bytes) / 1e9
     }
+    
+    /// Get compute capability as a single value - NOW PUBLIC
+    pub fn compute_capability(&self) -> f32 {
+        self.compute_capability_major as f32 + (self.compute_capability_minor as f32) / 10.0
+    }
 }
 
 /// CUDA memory manager with real device queries
@@ -903,10 +964,10 @@ pub struct CudaMemoryManager {
 }
 
 #[derive(Debug, Default)]
-struct DeviceStats {
-    total_allocated: usize,
-    peak_allocated: usize,
-    allocation_count: usize,
+pub struct DeviceStats {
+    pub total_allocated: usize,
+    pub peak_allocated: usize,
+    pub allocation_count: usize,
 }
 
 impl CudaMemoryManager {
@@ -1042,6 +1103,26 @@ impl CudaMemoryManager {
                 device_stats.total_allocated = device_stats.total_allocated.saturating_sub(size);
             }
         }
+    }
+    
+    /// Get device count - NOW PUBLIC
+    pub fn device_count(&self) -> usize {
+        self.device_infos.len()
+    }
+    
+    /// Get current device - NOW PUBLIC
+    pub fn current_device(&self) -> i32 {
+        self.current_device
+    }
+    
+    /// Check if initialized - NOW PUBLIC
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+    
+    /// Get allocation stats - NOW PUBLIC
+    pub fn allocation_stats(&self) -> Arc<Mutex<HashMap<i32, DeviceStats>>> {
+        Arc::clone(&self.allocation_stats)
     }
 }
 
@@ -1189,6 +1270,11 @@ impl CudaContext {
         }
         Ok(())
     }
+    
+    /// Get all streams - NOW PUBLIC
+    pub fn streams(&self) -> Arc<Mutex<HashMap<i32, Arc<CudaStream>>>> {
+        Arc::clone(&self.streams)
+    }
 }
 
 /// CUDA tensor that directly references device memory with real operations
@@ -1236,6 +1322,24 @@ impl CudaTensor {
         })
     }
 
+    /// Create tensor from raw device pointer - NOW PUBLIC (DANGEROUS)
+    pub unsafe fn from_raw_ptr(
+        device_ptr: *mut u8,
+        shape: Vec<usize>,
+        element_size: usize,
+        device_id: i32,
+    ) -> Result<Self, CudaError> {
+        let device_ptr = NonNull::new(device_ptr).ok_or(CudaError(CUDA_ERROR_INVALID_VALUE))?;
+        
+        Ok(CudaTensor {
+            device_ptr,
+            shape,
+            element_size,
+            device_id,
+            _page_ref: None,
+        })
+    }
+
     /// Get raw device pointer
     pub fn device_ptr(&self) -> *mut c_void {
         self.device_ptr.as_ptr() as *mut c_void
@@ -1249,6 +1353,11 @@ impl CudaTensor {
     /// Get device ID
     pub fn device_id(&self) -> i32 {
         self.device_id
+    }
+
+    /// Get element size - NOW PUBLIC
+    pub fn element_size(&self) -> usize {
+        self.element_size
     }
 
     /// Zero-copy reshape (just update metadata)
@@ -1355,6 +1464,40 @@ impl CudaTensor {
         }
     }
 
+    /// Copy from another tensor (device-to-device) - NOW PUBLIC
+    pub fn copy_from_tensor(&self, src: &CudaTensor) -> Result<(), CudaError> {
+        if self.size_bytes() != src.size_bytes() {
+            return Err(CudaError(CUDA_ERROR_INVALID_VALUE));
+        }
+
+        #[cfg(cuda_available)]
+        unsafe {
+            let result = cudaSetDevice(self.device_id);
+            if result != CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+
+            let result = cudaMemcpy(
+                self.device_ptr() as *mut c_void,
+                src.device_ptr() as *const c_void,
+                self.size_bytes(),
+                CUDA_MEMCPY_DEVICE_TO_DEVICE,
+            );
+
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                log::trace!("CUDA tensor device-to-device copy: {} bytes", self.size_bytes());
+                Ok(())
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+
     /// Synchronize tensor operations
     pub fn synchronize(&self) -> Result<(), CudaError> {
         #[cfg(cuda_available)]
@@ -1380,6 +1523,206 @@ impl CudaTensor {
     /// Get tensor size in bytes
     pub fn size_bytes(&self) -> usize {
         self.shape.iter().product::<usize>() * self.element_size
+    }
+    
+    /// Get number of elements - NOW PUBLIC
+    pub fn num_elements(&self) -> usize {
+        self.shape.iter().product()
+    }
+    
+    /// Get tensor dimensions - NOW PUBLIC
+    pub fn ndim(&self) -> usize {
+        self.shape.len()
+    }
+    
+    /// Get page reference if available - NOW PUBLIC
+    pub fn page_ref(&self) -> Option<&Arc<CudaPage>> {
+        self._page_ref.as_ref()
+    }
+}
+
+/// Direct low-level CUDA API wrappers - ALL PUBLIC
+pub mod raw {
+    use super::*;
+    
+    /// Set CUDA device
+    pub fn set_device(device_id: i32) -> Result<(), CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let result = cudaSetDevice(device_id);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(())
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Get current CUDA device
+    pub fn get_device() -> Result<i32, CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let mut device = 0;
+            let result = cudaGetDevice(&mut device);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(device)
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Get device count
+    pub fn get_device_count() -> Result<i32, CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let mut count = 0;
+            let result = cudaGetDeviceCount(&mut count);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(count)
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Raw memory allocation
+    pub fn malloc(size: usize) -> Result<*mut c_void, CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let mut ptr = std::ptr::null_mut();
+            let result = cudaMalloc(&mut ptr, size);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(ptr)
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Raw memory deallocation
+    pub fn free(ptr: *mut c_void) -> Result<(), CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let result = cudaFree(ptr);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(())
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Raw memory copy
+    pub fn memcpy(dst: *mut c_void, src: *const c_void, count: usize, kind: i32) -> Result<(), CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let result = cudaMemcpy(dst, src, count, kind);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(())
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Raw memory set
+    pub fn memset(ptr: *mut c_void, value: i32, count: usize) -> Result<(), CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let result = cudaMemset(ptr, value, count);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(())
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Device synchronize
+    pub fn device_synchronize() -> Result<(), CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let result = cudaDeviceSynchronize();
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok(())
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Get memory info
+    pub fn mem_get_info() -> Result<(usize, usize), CudaError> {
+        #[cfg(cuda_available)]
+        unsafe {
+            let mut free = 0;
+            let mut total = 0;
+            let result = cudaMemGetInfo(&mut free, &mut total);
+            if result != CUDA_SUCCESS {
+                Err(CudaError(result))
+            } else {
+                Ok((free, total))
+            }
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            Err(CudaError(CUDA_ERROR_NOT_INITIALIZED))
+        }
+    }
+    
+    /// Get last error
+    pub fn get_last_error() -> CudaError {
+        #[cfg(cuda_available)]
+        unsafe {
+            CudaError(cudaGetLastError())
+        }
+        
+        #[cfg(not(cuda_available))]
+        {
+            CudaError(CUDA_ERROR_NOT_INITIALIZED)
+        }
     }
 }
 
@@ -1465,6 +1808,83 @@ pub fn cuda_memory_test(device_id: i32, test_size: usize) -> Result<f64, CudaErr
     }
 }
 
+/// CUDA memory pool for efficient allocation - NOW PUBLIC
+#[derive(Debug)]
+pub struct CudaMemoryPool {
+    pages: Vec<Arc<CudaPage>>,
+    device_id: i32,
+    page_size: usize,
+    allocation_count: AtomicUsize,
+}
+
+impl CudaMemoryPool {
+    /// Create new memory pool
+    pub fn new(device_id: i32, page_size: usize, initial_pages: usize) -> Result<Self, CudaError> {
+        let mut pages = Vec::with_capacity(initial_pages);
+        
+        for _ in 0..initial_pages {
+            let page = CudaPage::new(page_size, device_id)?;
+            pages.push(Arc::new(page));
+        }
+        
+        Ok(CudaMemoryPool {
+            pages,
+            device_id,
+            page_size,
+            allocation_count: AtomicUsize::new(0),
+        })
+    }
+    
+    /// Allocate from pool
+    pub fn allocate(&self, size: usize, align: usize) -> Option<(Arc<CudaPage>, NonNull<u8>)> {
+        for page in &self.pages {
+            if let Some(ptr) = page.allocate(size, align) {
+                self.allocation_count.fetch_add(1, Ordering::Relaxed);
+                return Some((Arc::clone(page), ptr));
+            }
+        }
+        None
+    }
+    
+    /// Add new page to pool
+    pub fn expand(&mut self) -> Result<(), CudaError> {
+        let page = CudaPage::new(self.page_size, self.device_id)?;
+        self.pages.push(Arc::new(page));
+        Ok(())
+    }
+    
+    /// Reset all pages
+    pub fn reset(&self) {
+        for page in &self.pages {
+            page.reset();
+        }
+        self.allocation_count.store(0, Ordering::Relaxed);
+    }
+    
+    /// Get pool statistics
+    pub fn stats(&self) -> (usize, usize, usize) {
+        let total_pages = self.pages.len();
+        let total_size = total_pages * self.page_size;
+        let allocations = self.allocation_count.load(Ordering::Relaxed);
+        (total_pages, total_size, allocations)
+    }
+    
+    /// Get device ID - NOW PUBLIC
+    pub fn device_id(&self) -> i32 {
+        self.device_id
+    }
+    
+    /// Get page size - NOW PUBLIC
+    pub fn page_size(&self) -> usize {
+        self.page_size
+    }
+    
+    /// Get pages - NOW PUBLIC
+    pub fn pages(&self) -> &[Arc<CudaPage>] {
+        &self.pages
+    }
+}
+
 /// Comprehensive CUDA diagnosis
 pub fn diagnose_cuda_issues() {
     println!("🔍 CUDA Diagnosis:");
@@ -1486,4 +1906,34 @@ pub fn diagnose_cuda_issues() {
     
     // 3. Check runtime linking
     let _ = verify_cuda_runtime_linked();
+    
+    // 4. Test basic operations
+    #[cfg(cuda_available)]
+    {
+        match raw::get_device_count() {
+            Ok(count) => println!("✅ Device count: {}", count),
+            Err(e) => println!("❌ Failed to get device count: {}", e),
+        }
+        
+        match raw::get_device() {
+            Ok(device) => println!("✅ Current device: {}", device),
+            Err(e) => println!("❌ Failed to get current device: {}", e),
+        }
+        
+        match raw::mem_get_info() {
+            Ok((free, total)) => println!("✅ Memory: {} MB free / {} MB total", 
+                                          free / 1024 / 1024, total / 1024 / 1024),
+            Err(e) => println!("❌ Failed to get memory info: {}", e),
+        }
+        
+        // Test allocation
+        match raw::malloc(1024) {
+            Ok(ptr) => {
+                println!("✅ Test allocation successful");
+                let _ = raw::free(ptr);
+                println!("✅ Test deallocation successful");
+            }
+            Err(e) => println!("❌ Test allocation failed: {}", e),
+        }
+    }
 }
