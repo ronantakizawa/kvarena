@@ -1,30 +1,71 @@
-// src/zero_copy.rs - TRUE bump allocation with lock-free slab recycling
+// src/zero_copy.rs - Final version without duplicate methods
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::ptr::NonNull;
 use crossbeam::queue::SegQueue;
 use crate::cuda::{CudaPage, CudaError, CudaContext};
 
-/// TRUE zero-copy tensor with NO page references - enables slab recycling
+/// Zero-copy tensor with clear distinction between metadata and data operations
 #[derive(Debug)]
 pub struct ZeroCopyTensor {
-    /// Direct device pointers (no page reference needed)
     key_device_ptr: NonNull<u8>,
     value_device_ptr: NonNull<u8>,
-    /// Current sequence length (ONLY mutable state)
     current_seq_len: AtomicUsize,
-    /// Immutable tensor parameters
     max_seq_len: usize,
     num_heads: usize,
     head_dim: usize,
     element_size: usize,
-    device_id: i32,      // Store device_id directly, not page reference
+    device_id: i32,
     arena_id: u64,
-    // REMOVED: _page_ref: Arc<CudaPage>, // This prevented slab recycling!
+}
+
+/// Extension operation result with clear semantics
+#[derive(Debug, Clone)]
+pub enum ExtensionResult {
+    PureZeroCopy {
+        old_seq_len: usize,
+        new_seq_len: usize,
+        operation_time_ns: u64,
+    },
+    RequiresDataCopy {
+        old_seq_len: usize,
+        new_seq_len: usize,
+        copy_region_start: usize,
+        copy_region_size: usize,
+        metadata_update_time_ns: u64,
+    },
+    CannotExtend {
+        current_seq_len: usize,
+        max_seq_len: usize,
+        requested_seq_len: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub enum DataCopyOperation {
+    NewTokensCopy {
+        start_token_idx: usize,
+        num_tokens: usize,
+        copy_size_bytes: usize,
+    },
+    FullTensorCopy {
+        total_size_bytes: usize,
+    },
+    IncrementalCopy {
+        append_offset: usize,
+        append_size_bytes: usize,
+    },
+}
+
+#[derive(Debug, Clone)]
+pub struct DataCopyStats {
+    pub operation: DataCopyOperation,
+    pub copy_time_ns: u64,
+    pub bytes_copied: usize,
+    pub bandwidth_gbps: f64,
 }
 
 impl ZeroCopyTensor {
-    /// Create from bump allocation with NO page reference
     pub fn from_bump_allocation(
         device_ptr: NonNull<u8>,
         initial_seq_len: usize,
@@ -33,18 +74,13 @@ impl ZeroCopyTensor {
         head_dim: usize,
         element_size: usize,
         arena_id: u64,
-        device_id: i32,  // Pass device_id directly
+        device_id: i32,
     ) -> Result<Self, CudaError> {
-        // K tensor at start, V tensor after max K tensor space
         let key_device_ptr = device_ptr;
-        
         let k_tensor_max_size = max_seq_len * num_heads * head_dim * element_size;
         let value_device_ptr = unsafe {
             NonNull::new_unchecked(device_ptr.as_ptr().add(k_tensor_max_size))
         };
-        
-        log::debug!("Created tensor with NO page reference: initial={}, max={}, device={}", 
-                   initial_seq_len, max_seq_len, device_id);
         
         Ok(ZeroCopyTensor {
             key_device_ptr,
@@ -54,99 +90,112 @@ impl ZeroCopyTensor {
             num_heads,
             head_dim,
             element_size,
-            device_id,  // Direct storage, no Arc reference
+            device_id,
             arena_id,
-            // NO page reference - enables true slab recycling
         })
     }
 
-    /// TRUE zero-copy extension - ATOMIC metadata update ONLY
-    pub fn extend_zero_copy(&self, new_seq_len: usize) -> Result<bool, CudaError> {
-        if new_seq_len > self.max_seq_len {
-            return Ok(false); // Cannot extend beyond pre-allocated space
-        }
-
+    pub fn extend_metadata_only(&self, new_seq_len: usize) -> ExtensionResult {
+        let start_time = std::time::Instant::now();
         let old_seq_len = self.current_seq_len.load(Ordering::Relaxed);
         
-        if new_seq_len <= old_seq_len {
-            return Ok(true); // Already at or past this length
+        if new_seq_len > self.max_seq_len {
+            return ExtensionResult::CannotExtend {
+                current_seq_len: old_seq_len,
+                max_seq_len: self.max_seq_len,
+                requested_seq_len: new_seq_len,
+            };
         }
         
-        // ATOMIC update of sequence length - THIS IS THE ENTIRE EXTENSION OPERATION
+        if new_seq_len <= old_seq_len {
+            let operation_time = start_time.elapsed().as_nanos() as u64;
+            return ExtensionResult::PureZeroCopy {
+                old_seq_len,
+                new_seq_len: old_seq_len,
+                operation_time_ns: operation_time,
+            };
+        }
+        
         self.current_seq_len.store(new_seq_len, Ordering::Release);
+        let operation_time = start_time.elapsed().as_nanos() as u64;
         
-        log::debug!("TRUE zero-copy extension: {} -> {} tokens (NO page reference needed)", 
-                   old_seq_len, new_seq_len);
+        ExtensionResult::PureZeroCopy {
+            old_seq_len,
+            new_seq_len,
+            operation_time_ns: operation_time,
+        }
+    }
+
+    pub fn extend_with_data_requirements(&self, new_seq_len: usize) -> ExtensionResult {
+        let start_time = std::time::Instant::now();
+        let old_seq_len = self.current_seq_len.load(Ordering::Relaxed);
         
-        Ok(true)
+        if new_seq_len > self.max_seq_len {
+            return ExtensionResult::CannotExtend {
+                current_seq_len: old_seq_len,
+                max_seq_len: self.max_seq_len,
+                requested_seq_len: new_seq_len,
+            };
+        }
+        
+        if new_seq_len <= old_seq_len {
+            self.current_seq_len.store(new_seq_len, Ordering::Release);
+            let operation_time = start_time.elapsed().as_nanos() as u64;
+            return ExtensionResult::PureZeroCopy {
+                old_seq_len,
+                new_seq_len,
+                operation_time_ns: operation_time,
+            };
+        }
+        
+        self.current_seq_len.store(new_seq_len, Ordering::Release);
+        let metadata_time = start_time.elapsed().as_nanos() as u64;
+        
+        let new_tokens = new_seq_len - old_seq_len;
+        let token_size = self.num_heads * self.head_dim * self.element_size;
+        let copy_size = new_tokens * token_size * 2;
+        
+        ExtensionResult::RequiresDataCopy {
+            old_seq_len,
+            new_seq_len,
+            copy_region_start: old_seq_len,
+            copy_region_size: copy_size,
+            metadata_update_time_ns: metadata_time,
+        }
     }
 
-    /// Get current sequence length (atomic read)
-    pub fn seq_len(&self) -> usize {
-        self.current_seq_len.load(Ordering::Acquire)
-    }
-
-    /// Get maximum pre-allocated sequence length
-    pub fn max_seq_len(&self) -> usize {
-        self.max_seq_len
-    }
-
-    /// Check if can extend to new length without any memory operations
-    pub fn can_extend_zero_copy_to(&self, new_seq_len: usize) -> bool {
-        new_seq_len <= self.max_seq_len
-    }
-
-    /// Get key tensor device pointer using pure pointer arithmetic
-    pub fn key_device_ptr(&self) -> *mut std::ffi::c_void {
-        self.key_device_ptr.as_ptr() as *mut std::ffi::c_void
-    }
-
-    /// Get value tensor device pointer using pure pointer arithmetic
-    pub fn value_device_ptr(&self) -> *mut std::ffi::c_void {
-        self.value_device_ptr.as_ptr() as *mut std::ffi::c_void
-    }
-
-    /// Get tensor dimensions (current_seq_len, num_heads, head_dim)
-    pub fn dimensions(&self) -> (usize, usize, usize) {
-        (self.seq_len(), self.num_heads, self.head_dim)
-    }
-
-    /// Get current key tensor size in bytes
-    pub fn current_key_size_bytes(&self) -> usize {
-        self.seq_len() * self.num_heads * self.head_dim * self.element_size
-    }
-
-    /// Get current value tensor size in bytes
-    pub fn current_value_size_bytes(&self) -> usize {
-        self.seq_len() * self.num_heads * self.head_dim * self.element_size
-    }
-
-    /// Get total allocated size (for memory accounting)
-    pub fn max_allocated_size_bytes(&self) -> usize {
-        2 * self.max_seq_len * self.num_heads * self.head_dim * self.element_size
-    }
-
-    /// Copy NEW tokens only (for incremental generation)
-    pub fn copy_new_tokens_only(
+    pub fn copy_new_token_data(
         &self,
         host_key_data: *const u8,
         host_value_data: *const u8,
-        start_token_idx: usize,
-        num_new_tokens: usize,
-    ) -> Result<(), CudaError> {
-        let current_seq_len = self.seq_len();
+        data_copy_op: DataCopyOperation,
+    ) -> Result<DataCopyStats, CudaError> {
+        let start_time = std::time::Instant::now();
         
-        if start_token_idx + num_new_tokens > current_seq_len {
+        let (start_token_idx, num_tokens, _description) = match data_copy_op {
+            DataCopyOperation::NewTokensCopy { start_token_idx, num_tokens, .. } => {
+                (start_token_idx, num_tokens, "new tokens copy")
+            },
+            DataCopyOperation::IncrementalCopy { append_offset, append_size_bytes } => {
+                let token_size = self.num_heads * self.head_dim * self.element_size;
+                let num_tokens = append_size_bytes / (token_size * 2);
+                (append_offset / token_size, num_tokens, "incremental copy")
+            },
+            DataCopyOperation::FullTensorCopy { .. } => {
+                (0, self.seq_len(), "full tensor copy")
+            },
+        };
+        
+        let current_seq_len = self.seq_len();
+        if start_token_idx + num_tokens > current_seq_len {
             return Err(CudaError(-1));
         }
 
         let token_size = self.num_heads * self.head_dim * self.element_size;
-        let copy_size = num_new_tokens * token_size;
+        let copy_size = num_tokens * token_size;
         let offset = start_token_idx * token_size;
 
-        // Direct device memory operations
         unsafe {
-            // Copy to K tensor
             let dst_key = self.key_device_ptr.as_ptr().add(offset);
             let src_key = host_key_data.add(offset);
             
@@ -165,7 +214,6 @@ impl ZeroCopyTensor {
             #[cfg(not(feature = "cuda"))]
             std::ptr::copy_nonoverlapping(src_key, dst_key, copy_size);
 
-            // Copy to V tensor
             let dst_value = self.value_device_ptr.as_ptr().add(offset);
             let src_value = host_value_data.add(offset);
             
@@ -185,18 +233,77 @@ impl ZeroCopyTensor {
             std::ptr::copy_nonoverlapping(src_value, dst_value, copy_size);
         }
 
-        log::debug!("Copied {} NEW tokens ONLY ({}KB) - no page reference needed", 
-                   num_new_tokens, copy_size / 1024);
+        let copy_time = start_time.elapsed();
         
-        Ok(())
+        Ok(DataCopyStats {
+            operation: data_copy_op,
+            copy_time_ns: copy_time.as_nanos() as u64,
+            bytes_copied: copy_size * 2,
+            bandwidth_gbps: if copy_time.as_secs_f64() > 0.0 {
+                (copy_size * 2) as f64 / copy_time.as_secs_f64() / 1e9
+            } else {
+                0.0
+            },
+        })
     }
 
-    /// Get device ID
+    pub fn extend_zero_copy(&self, new_seq_len: usize) -> Result<bool, CudaError> {
+        match self.extend_metadata_only(new_seq_len) {
+            ExtensionResult::PureZeroCopy { .. } => Ok(true),
+            ExtensionResult::RequiresDataCopy { .. } => Ok(false),
+            ExtensionResult::CannotExtend { .. } => Ok(false),
+        }
+    }
+
+    // Standard getters and compatibility methods
+    pub fn seq_len(&self) -> usize {
+        self.current_seq_len.load(Ordering::Acquire)
+    }
+
+    pub fn max_seq_len(&self) -> usize {
+        self.max_seq_len
+    }
+
+    pub fn can_extend_zero_copy_to(&self, new_seq_len: usize) -> bool {
+        new_seq_len <= self.max_seq_len
+    }
+
+    pub fn key_device_ptr(&self) -> *mut std::ffi::c_void {
+        self.key_device_ptr.as_ptr() as *mut std::ffi::c_void
+    }
+
+    pub fn value_device_ptr(&self) -> *mut std::ffi::c_void {
+        self.value_device_ptr.as_ptr() as *mut std::ffi::c_void
+    }
+
+    pub fn dimensions(&self) -> (usize, usize, usize) {
+        (self.seq_len(), self.num_heads, self.head_dim)
+    }
+
+    pub fn current_key_size_bytes(&self) -> usize {
+        self.seq_len() * self.num_heads * self.head_dim * self.element_size
+    }
+
+    pub fn current_value_size_bytes(&self) -> usize {
+        self.seq_len() * self.num_heads * self.head_dim * self.element_size
+    }
+
+    pub fn max_allocated_size_bytes(&self) -> usize {
+        2 * self.max_seq_len * self.num_heads * self.head_dim * self.element_size
+    }
+
     pub fn device_id(&self) -> i32 {
         self.device_id
     }
 
-    /// Get zero-copy extension statistics
+    pub fn arena_id(&self) -> u64 {
+        self.arena_id
+    }
+
+    pub fn size_bytes(&self) -> usize {
+        self.current_key_size_bytes() + self.current_value_size_bytes()
+    }
+
     pub fn zero_copy_stats(&self) -> ZeroCopyStats {
         let current_len = self.seq_len();
         let utilization = current_len as f64 / self.max_seq_len as f64;
@@ -210,39 +317,36 @@ impl ZeroCopyTensor {
             utilization,
             memory_efficiency,
             can_grow_without_copy: current_len < self.max_seq_len,
+            metadata_operations_are_zero_copy: true,
+            data_operations_require_copy: true,
+            last_extension_was_pure_zero_copy: None,
         }
-    }
-
-    pub fn arena_id(&self) -> u64 {
-        self.arena_id
-    }
-
-    pub fn size_bytes(&self) -> usize {
-        self.current_key_size_bytes() + self.current_value_size_bytes()
-    }
-
-    /// Synchronization without page reference
-    pub fn synchronize(&self) -> Result<(), CudaError> {
-        #[cfg(feature = "cuda")]
-        unsafe {
-            // Set device context
-            let result = crate::cuda::cudaSetDevice(self.device_id);
-            if result != crate::cuda::CUDA_SUCCESS {
-                return Err(CudaError(result));
-            }
-            
-            // Synchronize device
-            let result = crate::cuda::cudaDeviceSynchronize();
-            if result != crate::cuda::CUDA_SUCCESS {
-                return Err(CudaError(result));
-            }
-        }
-        Ok(())
     }
 
     // Compatibility methods
+    pub fn copy_new_tokens_only(
+        &self,
+        host_key_data: *const u8,
+        host_value_data: *const u8,
+        start_token_idx: usize,
+        num_new_tokens: usize,
+    ) -> Result<(), CudaError> {
+        let copy_op = DataCopyOperation::NewTokensCopy {
+            start_token_idx,
+            num_tokens: num_new_tokens,
+            copy_size_bytes: num_new_tokens * self.num_heads * self.head_dim * self.element_size * 2,
+        };
+        
+        self.copy_new_token_data(host_key_data, host_value_data, copy_op)?;
+        Ok(())
+    }
+
     pub fn copy_from_host(&self, host_key_data: *const u8, host_value_data: *const u8) -> Result<(), CudaError> {
-        self.copy_new_tokens_only(host_key_data, host_value_data, 0, self.seq_len())
+        let copy_op = DataCopyOperation::FullTensorCopy {
+            total_size_bytes: self.size_bytes(),
+        };
+        self.copy_new_token_data(host_key_data, host_value_data, copy_op)?;
+        Ok(())
     }
 
     pub fn copy_new_tokens_from_host(
@@ -262,9 +366,24 @@ impl ZeroCopyTensor {
     pub fn memory_efficiency(&self) -> f64 {
         self.utilization()
     }
+
+    pub fn synchronize(&self) -> Result<(), CudaError> {
+        #[cfg(feature = "cuda")]
+        unsafe {
+            let result = crate::cuda::cudaSetDevice(self.device_id);
+            if result != crate::cuda::CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+            
+            let result = crate::cuda::cudaDeviceSynchronize();
+            if result != crate::cuda::CUDA_SUCCESS {
+                return Err(CudaError(result));
+            }
+        }
+        Ok(())
+    }
 }
 
-/// Zero-copy extension statistics
 #[derive(Debug, Clone)]
 pub struct ZeroCopyStats {
     pub current_seq_len: usize,
@@ -273,24 +392,231 @@ pub struct ZeroCopyStats {
     pub utilization: f64,
     pub memory_efficiency: f64,
     pub can_grow_without_copy: bool,
+    pub metadata_operations_are_zero_copy: bool,
+    pub data_operations_require_copy: bool,
+    pub last_extension_was_pure_zero_copy: Option<bool>,
 }
 
-/// TRUE slab recycling with lock-free SegQueue - NO Arc<CudaPage>
+#[derive(Debug, Clone)]
+pub enum ExtensionOperationResult {
+    PureZeroCopy {
+        operation_time_ns: u64,
+        tokens_added: usize,
+    },
+    RequiresDataCopy {
+        metadata_update_time_ns: u64,
+        tokens_added: usize,
+        copy_start_token: usize,
+        copy_size_bytes: usize,
+    },
+}
+
+#[derive(Debug)]
+pub struct ZeroCopyArena {
+    page: CudaPage,
+    arena_id: u64,
+    current_offset: AtomicUsize,
+    slab_pool: Arc<GlobalSlabPool>,
+}
+
+impl ZeroCopyArena {
+    pub fn new(
+        page: CudaPage,
+        arena_id: u64,
+        slab_pool: Arc<GlobalSlabPool>,
+    ) -> Self {
+        Self {
+            page,
+            arena_id,
+            current_offset: AtomicUsize::new(0),
+            slab_pool,
+        }
+    }
+
+    /// SINGLE extend_tensor_for_generation method - returns bool for compatibility
+    pub fn extend_tensor_for_generation(
+        &self,
+        tensor: &mut ZeroCopyTensor,
+        additional_tokens: usize,
+    ) -> Result<bool, CudaError> {
+        let current_len = tensor.seq_len();
+        let new_len = current_len + additional_tokens;
+        
+        match tensor.extend_with_data_requirements(new_len) {
+            ExtensionResult::PureZeroCopy { .. } => {
+                Ok(true) // TRUE zero-copy
+            },
+            ExtensionResult::RequiresDataCopy { .. } => {
+                Ok(false) // Metadata updated but data copy required
+            },
+            ExtensionResult::CannotExtend { .. } => {
+                Err(CudaError(-1))
+            },
+        }
+    }
+
+    /// New method for detailed extension results
+    pub fn extend_tensor_detailed(
+        &self,
+        tensor: &mut ZeroCopyTensor,
+        additional_tokens: usize,
+    ) -> Result<ExtensionOperationResult, CudaError> {
+        let current_len = tensor.seq_len();
+        let new_len = current_len + additional_tokens;
+        
+        match tensor.extend_with_data_requirements(new_len) {
+            ExtensionResult::PureZeroCopy { operation_time_ns, .. } => {
+                Ok(ExtensionOperationResult::PureZeroCopy {
+                    operation_time_ns,
+                    tokens_added: additional_tokens,
+                })
+            },
+            ExtensionResult::RequiresDataCopy { 
+                copy_region_start, 
+                copy_region_size, 
+                metadata_update_time_ns,
+                ..
+            } => {
+                Ok(ExtensionOperationResult::RequiresDataCopy {
+                    metadata_update_time_ns,
+                    tokens_added: additional_tokens,
+                    copy_start_token: copy_region_start,
+                    copy_size_bytes: copy_region_size,
+                })
+            },
+            ExtensionResult::CannotExtend { .. } => {
+                Err(CudaError(-1))
+            },
+        }
+    }
+
+    pub fn bump_allocate(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
+        const CUDA_ALIGNMENT: usize = 256;
+        let required_align = align.max(CUDA_ALIGNMENT);
+        
+        let aligned_size = if size == 0 {
+            required_align
+        } else {
+            if size > usize::MAX - required_align {
+                return None;
+            }
+            let aligned = (size + required_align - 1) & !(required_align - 1);
+            aligned.max(32)
+        };
+        
+        let old_offset = self.current_offset.fetch_add(aligned_size, Ordering::Relaxed);
+        
+        if old_offset > self.page.size() || aligned_size > self.page.size() - old_offset {
+            self.current_offset.fetch_sub(aligned_size, Ordering::Relaxed);
+            return None;
+        }
+        
+        unsafe {
+            let base_ptr = self.page.device_ptr() as *mut u8;
+            let alloc_ptr = base_ptr.add(old_offset);
+            Some(NonNull::new_unchecked(alloc_ptr))
+        }
+    }
+
+    pub fn allocate_kv_tensor_with_growth(
+        &self,
+        initial_seq_len: usize,
+        expected_max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        element_size: usize,
+    ) -> Result<ZeroCopyTensor, CudaError> {
+        let max_k_size = expected_max_seq_len * num_heads * head_dim * element_size;
+        let max_v_size = expected_max_seq_len * num_heads * head_dim * element_size;
+        let total_max_size = max_k_size + max_v_size;
+        
+        const CUDA_ALIGNMENT: usize = 256;
+        
+        if total_max_size > 1024 * 1024 * 1024 {
+            return Err(CudaError(-4));
+        }
+        
+        let device_ptr = self.bump_allocate(total_max_size, CUDA_ALIGNMENT)
+            .ok_or(CudaError(-2))?;
+        
+        ZeroCopyTensor::from_bump_allocation(
+            device_ptr,
+            initial_seq_len,
+            expected_max_seq_len,
+            num_heads,
+            head_dim,
+            element_size,
+            self.arena_id,
+            self.page.device_id(),
+        )
+    }
+
+    // Compatibility methods
+    pub fn allocate_tensor_with_growth(
+        &self,
+        initial_seq_len: usize,
+        expected_max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        element_size: usize,
+    ) -> Result<ZeroCopyTensor, CudaError> {
+        self.allocate_kv_tensor_with_growth(
+            initial_seq_len, expected_max_seq_len, num_heads, head_dim, element_size
+        )
+    }
+
+    // Arena state queries
+    pub fn page(&self) -> &CudaPage { &self.page }
+    pub fn arena_id(&self) -> u64 { self.arena_id }
+    pub fn current_offset(&self) -> usize { self.current_offset.load(Ordering::Relaxed) }
+    pub fn available_space(&self) -> usize { 
+        self.page.size().saturating_sub(self.current_offset()) 
+    }
+    pub fn utilization(&self) -> f64 {
+        self.current_offset() as f64 / self.page.size() as f64
+    }
+    pub fn synchronize(&self) -> Result<(), CudaError> { self.page.synchronize() }
+    pub fn is_ready(&self) -> Result<bool, CudaError> { self.page.is_ready() }
+
+    pub fn stats(&self) -> ZeroCopyArenaStats {
+        ZeroCopyArenaStats {
+            arena_id: self.arena_id,
+            device_id: self.page.device_id(),
+            page_size: self.page.size(),
+            used_bytes: self.current_offset(),
+            total_tensors: 0,
+            total_used_bytes: self.current_offset(),
+            total_allocated_bytes: self.page.size(),
+            avg_tensor_utilization: 0.0,
+            arena_utilization: self.utilization(),
+            cuda_memory_pressure: 0.0,
+        }
+    }
+
+    pub fn defragment(&self) -> Result<usize, CudaError> { Ok(0) }
+}
+
+impl Drop for ZeroCopyArena {
+    fn drop(&mut self) {
+        let page = unsafe { std::ptr::read(&self.page) };
+        std::mem::forget(&self.page);
+        self.slab_pool.return_page(page);
+    }
+}
+
+unsafe impl Send for ZeroCopyArena {}
+unsafe impl Sync for ZeroCopyArena {}
+
 #[derive(Debug)]
 pub struct GlobalSlabPool {
-    /// Lock-free queues for direct CudaPage recycling (NOT Arc<CudaPage>)
-    small_pages: SegQueue<CudaPage>,     // 0-512KB
-    medium_pages: SegQueue<CudaPage>,    // 512KB-2MB  
-    large_pages: SegQueue<CudaPage>,     // 2MB-8MB
-    huge_pages: SegQueue<CudaPage>,      // >8MB
-    
-    /// Statistics for monitoring
+    small_pages: SegQueue<CudaPage>,
+    medium_pages: SegQueue<CudaPage>,
+    large_pages: SegQueue<CudaPage>,
+    huge_pages: SegQueue<CudaPage>,
     pages_created: AtomicUsize,
     pages_recycled: AtomicUsize,
     pages_reused: AtomicUsize,
     bytes_saved: AtomicUsize,
-    
-    /// Configuration
     max_pages_per_class: usize,
 }
 
@@ -309,7 +635,6 @@ impl GlobalSlabPool {
         }
     }
 
-    /// Get size class queue for a given page size
     fn size_class_for_size(&self, size: usize) -> &SegQueue<CudaPage> {
         match size {
             0..=524_288 => &self.small_pages,
@@ -319,98 +644,44 @@ impl GlobalSlabPool {
         }
     }
 
-    /// Try to get a recycled page - returns actual CudaPage, not Arc
     pub fn get_page(&self, requested_size: usize, device_id: i32) -> Option<CudaPage> {
-        // Try exact size class first
-        if let Some(page) = self.try_get_from_exact_class(requested_size, device_id) {
-            return Some(page);
-        }
-
-        // Try larger size classes
-        self.try_get_from_larger_classes(requested_size, device_id)
-    }
-
-    fn try_get_from_exact_class(&self, requested_size: usize, device_id: i32) -> Option<CudaPage> {
         let queue = self.size_class_for_size(requested_size);
         
-        // Lock-free pop from SegQueue
         while let Some(page) = queue.pop() {
-            // Check if page matches requirements
             if page.size() >= requested_size && page.device_id() == device_id {
-                // Reset page for reuse
                 page.reset();
-                
                 self.pages_reused.fetch_add(1, Ordering::Relaxed);
                 self.bytes_saved.fetch_add(page.size(), Ordering::Relaxed);
-                
-                log::debug!("REAL slab reuse: {}KB page from exact class", page.size() / 1024);
                 return Some(page);
             } else {
-                // Page doesn't match, put it back
                 queue.push(page);
-                break; // Avoid infinite loop
+                break;
             }
         }
-        
         None
     }
 
-    fn try_get_from_larger_classes(&self, requested_size: usize, device_id: i32) -> Option<CudaPage> {
-        let larger_queues = [&self.medium_pages, &self.large_pages, &self.huge_pages];
-        
-        for queue in larger_queues {
-            if let Some(page) = queue.pop() {
-                if page.size() >= requested_size && page.device_id() == device_id {
-                    page.reset();
-                    
-                    self.pages_reused.fetch_add(1, Ordering::Relaxed);
-                    self.bytes_saved.fetch_add(page.size(), Ordering::Relaxed);
-                    
-                    log::debug!("REAL slab reuse: {}KB page from larger class", page.size() / 1024);
-                    return Some(page);
-                } else {
-                    // Put back and try next queue
-                    queue.push(page);
-                }
-            }
-        }
-        
-        None
-    }
-
-    /// Return page to pool - takes actual CudaPage, not Arc
     pub fn return_page(&self, page: CudaPage) {
         let size = page.size();
         let queue = self.size_class_for_size(size);
         
-        // Check pool capacity to prevent unbounded growth
         if self.approximate_queue_size(queue) >= self.max_pages_per_class {
-            log::debug!("Slab pool full for size {}, dropping page", size);
-            // Let page drop and be freed
             return;
         }
 
-        // Reset page and return to lock-free pool
         page.reset();
         queue.push(page);
-        
         self.pages_recycled.fetch_add(1, Ordering::Relaxed);
-        
-        log::debug!("REAL slab recycling: returned {}KB page to lock-free pool", size / 1024);
     }
 
-    /// Record new page creation (when no recycled page available)
     pub fn record_page_creation(&self, size: usize) {
         self.pages_created.fetch_add(1, Ordering::Relaxed);
     }
 
-    /// Approximate queue size (SegQueue doesn't provide exact len)
     fn approximate_queue_size(&self, queue: &SegQueue<CudaPage>) -> usize {
-        // Sample a few items to estimate size without emptying queue
         let mut count = 0;
         let mut temp_pages = Vec::new();
         
-        // Sample up to 10 items
         for _ in 0..10 {
             if let Some(page) = queue.pop() {
                 temp_pages.push(page);
@@ -420,16 +691,13 @@ impl GlobalSlabPool {
             }
         }
         
-        // Put sampled pages back
         for page in temp_pages {
             queue.push(page);
         }
         
-        // Estimate total size (rough approximation)
-        count * 5 // Assume we sampled ~20% of queue
+        count * 5
     }
 
-    /// Get recycling statistics
     pub fn stats(&self) -> SlabPoolStats {
         let created = self.pages_created.load(Ordering::Relaxed);
         let recycled = self.pages_recycled.load(Ordering::Relaxed);
@@ -456,7 +724,6 @@ impl GlobalSlabPool {
         ]
     }
 
-    /// Cleanup excess pages from all pools
     pub fn cleanup_old_pages(&self) -> usize {
         let mut cleaned = 0;
         let queues = [&self.small_pages, &self.medium_pages, &self.large_pages, &self.huge_pages];
@@ -469,267 +736,32 @@ impl GlobalSlabPool {
             for _ in 0..to_remove {
                 if queue.pop().is_some() {
                     cleaned += 1;
-                    // Page drops and gets freed
                 }
             }
-        }
-        
-        if cleaned > 0 {
-            log::info!("Cleaned up {} excess pages from lock-free slab pools", cleaned);
         }
         
         cleaned
     }
 }
 
-/// ZeroCopyArena with direct CudaPage ownership - NO Arc references
-#[derive(Debug)]
-pub struct ZeroCopyArena {
-    /// Direct CudaPage ownership (NOT Arc<CudaPage>)
-    page: CudaPage,
-    /// Arena ID for tracking
-    arena_id: u64,
-    /// Current bump offset (ONLY mutable state)
-    current_offset: AtomicUsize,
-    /// Reference to slab pool for cleanup
-    slab_pool: Arc<GlobalSlabPool>,
-}
-
-impl ZeroCopyArena {
-    /// Create with direct page ownership
-    pub fn new(
-        page: CudaPage,  // Take direct ownership, not Arc<CudaPage>
-        arena_id: u64,
-        slab_pool: Arc<GlobalSlabPool>,
-    ) -> Self {
-        Self {
-            page,  // Direct ownership
-            arena_id,
-            current_offset: AtomicUsize::new(0),
-            slab_pool,
-        }
-    }
-
-    /// Pure bump allocation with CUDA alignment and overflow protection
-    pub fn bump_allocate(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
-        // CRITICAL: Force CUDA alignment for all allocations
-        const CUDA_ALIGNMENT: usize = 256;
-        let required_align = align.max(CUDA_ALIGNMENT);
-        
-        // Safe size calculation with overflow protection
-        let aligned_size = if size == 0 {
-            required_align
-        } else {
-            // Check for overflow
-            if size > usize::MAX - required_align {
-                log::error!("Size too large for alignment: {}", size);
-                return None;
-            }
-            
-            // Calculate aligned size
-            let aligned = (size + required_align - 1) & !(required_align - 1);
-            aligned.max(32) // Minimum 32 bytes
-        };
-        
-        // Atomic bump allocation
-        let old_offset = self.current_offset.fetch_add(aligned_size, Ordering::Relaxed);
-        
-        // Check bounds with overflow protection
-        if old_offset > self.page.size() || aligned_size > self.page.size() - old_offset {
-            // Revert offset and fail
-            self.current_offset.fetch_sub(aligned_size, Ordering::Relaxed);
-            log::debug!("Arena allocation failed: {} bytes requested, {} available", 
-                       aligned_size, self.page.size().saturating_sub(old_offset));
-            return None;
-        }
-        
-        // Calculate device pointer directly from page
-        unsafe {
-            let base_ptr = self.page.device_ptr() as *mut u8;
-            let alloc_ptr = base_ptr.add(old_offset);
-            
-            // CRITICAL: Verify alignment before returning
-            let base_addr = base_ptr as usize;
-            let ptr_addr = alloc_ptr as usize;
-            
-            // Check base alignment
-            if base_addr % CUDA_ALIGNMENT != 0 {
-                log::error!("Page base pointer not aligned: {:p}", base_ptr);
-                self.current_offset.fetch_sub(aligned_size, Ordering::Relaxed);
-                return None;
-            }
-            
-            // Check final alignment
-            if ptr_addr % required_align != 0 {
-                log::error!("Arena pointer not aligned: {:p} (expected {} bytes)", 
-                           alloc_ptr, required_align);
-                self.current_offset.fetch_sub(aligned_size, Ordering::Relaxed);
-                return None;
-            }
-            
-            log::trace!("✓ Arena allocated {} bytes at offset {} (aligned ptr {:p})", 
-                       aligned_size, old_offset, alloc_ptr);
-            
-            Some(NonNull::new_unchecked(alloc_ptr))
-        }
-    }
-
-    /// Allocate KV tensor with CUDA alignment verification
-    pub fn allocate_kv_tensor_with_growth(
-        &self,
-        initial_seq_len: usize,
-        expected_max_seq_len: usize,
-        num_heads: usize,
-        head_dim: usize,
-        element_size: usize,
-    ) -> Result<ZeroCopyTensor, CudaError> {
-        let max_k_size = expected_max_seq_len * num_heads * head_dim * element_size;
-        let max_v_size = expected_max_seq_len * num_heads * head_dim * element_size;
-        let total_max_size = max_k_size + max_v_size;
-        
-        // CRITICAL: Use 256-byte alignment for CUDA compatibility
-        const CUDA_ALIGNMENT: usize = 256;
-        
-        // Verify tensor size is reasonable
-        if total_max_size > 1024 * 1024 * 1024 { // > 1GB
-            log::error!("Tensor too large: {} GB", total_max_size / 1024 / 1024 / 1024);
-            return Err(CudaError(-4));
-        }
-        
-        // Pure bump allocation with CUDA alignment
-        let device_ptr = self.bump_allocate(total_max_size, CUDA_ALIGNMENT)
-            .ok_or_else(|| {
-                log::error!("Failed to allocate {} bytes for KV tensor", total_max_size);
-                CudaError(-2)
-            })?;
-        
-        // Verify pointer alignment before creating tensor
-        let ptr_addr = device_ptr.as_ptr() as usize;
-        if ptr_addr % CUDA_ALIGNMENT != 0 {
-            log::error!("KV tensor pointer not properly aligned: {:p} (expected {} byte alignment)", 
-                       device_ptr.as_ptr(), CUDA_ALIGNMENT);
-            return Err(CudaError(-3));
-        }
-        
-        log::debug!("✓ KV tensor allocated with proper alignment: {:p} ({}KB total)", 
-                   device_ptr.as_ptr(), total_max_size / 1024);
-        
-        // Create tensor with NO page reference (enables slab recycling)
-        ZeroCopyTensor::from_bump_allocation(
-            device_ptr,
-            initial_seq_len,
-            expected_max_seq_len,
-            num_heads,
-            head_dim,
-            element_size,
-            self.arena_id,
-            self.page.device_id(), // Pass device_id directly, not page reference
-        )
-    }
-
-    /// Get direct page reference for operations
-    pub fn page(&self) -> &CudaPage {
-        &self.page
-    }
-
-    // Arena state queries
-    pub fn arena_id(&self) -> u64 { self.arena_id }
-    pub fn current_offset(&self) -> usize { self.current_offset.load(Ordering::Relaxed) }
-    pub fn available_space(&self) -> usize { 
-        self.page.size().saturating_sub(self.current_offset()) 
-    }
-    pub fn utilization(&self) -> f64 {
-        self.current_offset() as f64 / self.page.size() as f64
-    }
-
-    pub fn synchronize(&self) -> Result<(), CudaError> { self.page.synchronize() }
-    pub fn is_ready(&self) -> Result<bool, CudaError> { self.page.is_ready() }
-
-    // Compatibility methods
-    pub fn allocate_tensor_with_growth(
-        &self,
-        initial_seq_len: usize,
-        expected_max_seq_len: usize,
-        num_heads: usize,
-        head_dim: usize,
-        element_size: usize,
-    ) -> Result<ZeroCopyTensor, CudaError> {
-        self.allocate_kv_tensor_with_growth(
-            initial_seq_len, expected_max_seq_len, num_heads, head_dim, element_size
-        )
-    }
-
-    pub fn extend_tensor_for_generation(
-        &self,
-        tensor: &mut ZeroCopyTensor,
-        additional_tokens: usize,
-    ) -> Result<bool, CudaError> {
-        let current_len = tensor.seq_len();
-        let new_len = current_len + additional_tokens;
-        tensor.extend_zero_copy(new_len)
-    }
-
-    pub fn stats(&self) -> ZeroCopyArenaStats {
-        ZeroCopyArenaStats {
-            arena_id: self.arena_id,
-            device_id: self.page.device_id(),
-            page_size: self.page.size(),
-            used_bytes: self.current_offset(),
-            total_tensors: 0, // Not tracked in pure bump
-            total_used_bytes: self.current_offset(),
-            total_allocated_bytes: self.page.size(),
-            avg_tensor_utilization: 0.0,
-            arena_utilization: self.utilization(),
-            cuda_memory_pressure: 0.0,
-        }
-    }
-
-    pub fn defragment(&self) -> Result<usize, CudaError> { Ok(0) }
-}
-
-impl Drop for ZeroCopyArena {
-    fn drop(&mut self) {
-        log::debug!("Arena {} dropping - returning page to lock-free slab pool", self.arena_id);
-        
-        // CRITICAL: Take ownership of page and return to slab pool
-        // This requires unsafe because we need to move out of self
-        let page = unsafe { std::ptr::read(&self.page) };
-        std::mem::forget(&self.page); // Prevent double drop
-        
-        // Return actual CudaPage to lock-free pool
-        self.slab_pool.return_page(page);
-        
-        log::info!("Arena {} page returned to slab pool for recycling", self.arena_id);
-    }
-}
-
-// Note: We need to manually implement Send/Sync since we're using direct page ownership
-unsafe impl Send for ZeroCopyArena {}
-unsafe impl Sync for ZeroCopyArena {}
-
-/// Manager with lock-free slab recycling - NO Arc<CudaPage> tracking
 #[derive(Debug)]
 pub struct ZeroCopyManager {
     slab_pool: Arc<GlobalSlabPool>,
     cuda_context: Arc<CudaContext>,
     next_arena_id: AtomicUsize,
-    // REMOVED: active_arenas tracking - prevents slab recycling
 }
 
 impl ZeroCopyManager {
     pub fn new(slab_pool: Arc<GlobalSlabPool>) -> Result<Self, CudaError> {
-        // Use safe CUDA initialization
         let cuda_context = Arc::new(crate::cuda::create_safe_cuda_context()?);
         
         Ok(Self {
             slab_pool,
             cuda_context,
             next_arena_id: AtomicUsize::new(0),
-            // NO arena tracking - enables true slab recycling
         })
     }
 
-    /// Create arena with true slab recycling
     pub fn create_arena(
         &self,
         page_size: usize,
@@ -737,36 +769,28 @@ impl ZeroCopyManager {
     ) -> Result<ZeroCopyArena, CudaError> {
         let arena_id = self.next_arena_id.fetch_add(1, Ordering::Relaxed) as u64;
         
-        // Try to get recycled page from lock-free pool
         let page = if let Some(recycled_page) = self.slab_pool.get_page(page_size, device_id) {
-            log::debug!("Using recycled page for arena {}", arena_id);
             recycled_page
         } else {
-            // Allocate new page
             let new_page = self.cuda_context.allocate_page_on_device(page_size, device_id)?;
             self.slab_pool.record_page_creation(page_size);
             new_page
         };
         
-        // Create arena with direct page ownership
         let arena = ZeroCopyArena::new(
-            page,  // Direct ownership, not Arc
+            page,
             arena_id,
             Arc::clone(&self.slab_pool),
         );
 
-        log::debug!("Created arena {} with direct page ownership: {}KB on device {}", 
-                   arena_id, page_size / 1024, device_id);
-
         Ok(arena)
     }
 
-    // Simplified manager methods (no arena tracking)
     pub fn global_stats(&self) -> ZeroCopyGlobalStats {
         let slab_stats = self.slab_pool.stats();
         
         ZeroCopyGlobalStats {
-            total_arenas: 0, // Not tracked for slab recycling
+            total_arenas: 0,
             total_tensors: 0,
             total_used_bytes: 0,
             total_allocated_bytes: 0,
@@ -778,15 +802,8 @@ impl ZeroCopyManager {
         }
     }
 
-    pub fn cleanup_inactive_arenas(&self) -> usize { 
-        // Cleanup happens automatically via Drop trait - no tracking needed
-        0 
-    }
-    
-    pub fn defragment_all(&self) -> Result<usize, CudaError> { 
-        Ok(0) // No fragmentation in bump allocator
-    }
-    
+    pub fn cleanup_inactive_arenas(&self) -> usize { 0 }
+    pub fn defragment_all(&self) -> Result<usize, CudaError> { Ok(0) }
     pub fn synchronize_all(&self) -> Result<(), CudaError> { 
         self.cuda_context.synchronize_all()
     }
@@ -803,7 +820,7 @@ impl ZeroCopyManager {
     }
 }
 
-// Stats structs (simplified for bump allocation)
+// Stats structs
 #[derive(Debug, Clone)]
 pub struct SlabPoolStats {
     pub total_pages_created: usize,
@@ -860,4 +877,241 @@ pub struct ZeroCopyArenaStats {
     pub avg_tensor_utilization: f64,
     pub arena_utilization: f64,
     pub cuda_memory_pressure: f64,
+}
+
+// Additional utility implementations for thread safety
+unsafe impl Send for ZeroCopyTensor {}
+unsafe impl Sync for ZeroCopyTensor {}
+
+// Default implementations for key types
+impl Default for GlobalSlabPool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// Additional helper methods for ZeroCopyTensor
+impl ZeroCopyTensor {
+    /// Check if the tensor can accommodate the requested sequence length
+    pub fn has_capacity_for(&self, seq_len: usize) -> bool {
+        seq_len <= self.max_seq_len
+    }
+
+    /// Get the number of remaining tokens that can be added without reallocation
+    pub fn remaining_capacity(&self) -> usize {
+        self.max_seq_len.saturating_sub(self.seq_len())
+    }
+
+    /// Calculate memory overhead (allocated but unused space)
+    pub fn memory_overhead_bytes(&self) -> usize {
+        let allocated = self.max_allocated_size_bytes();
+        let used = self.size_bytes();
+        allocated.saturating_sub(used)
+    }
+
+    /// Get a detailed breakdown of memory usage
+    pub fn memory_breakdown(&self) -> TensorMemoryBreakdown {
+        let current_len = self.seq_len();
+        let key_size = self.current_key_size_bytes();
+        let value_size = self.current_value_size_bytes();
+        let overhead = self.memory_overhead_bytes();
+        
+        TensorMemoryBreakdown {
+            current_seq_len: current_len,
+            max_seq_len: self.max_seq_len,
+            key_tensor_bytes: key_size,
+            value_tensor_bytes: value_size,
+            total_used_bytes: key_size + value_size,
+            total_allocated_bytes: self.max_allocated_size_bytes(),
+            overhead_bytes: overhead,
+            utilization_ratio: self.utilization(),
+            waste_ratio: overhead as f64 / self.max_allocated_size_bytes() as f64,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct TensorMemoryBreakdown {
+    pub current_seq_len: usize,
+    pub max_seq_len: usize,
+    pub key_tensor_bytes: usize,
+    pub value_tensor_bytes: usize,
+    pub total_used_bytes: usize,
+    pub total_allocated_bytes: usize,
+    pub overhead_bytes: usize,
+    pub utilization_ratio: f64,
+    pub waste_ratio: f64,
+}
+
+// Additional methods for ZeroCopyArena
+impl ZeroCopyArena {
+    /// Create multiple tensors in a single allocation for batch processing
+    pub fn allocate_tensor_batch(
+        &self,
+        count: usize,
+        initial_seq_len: usize,
+        expected_max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+        element_size: usize,
+    ) -> Result<Vec<ZeroCopyTensor>, CudaError> {
+        let mut tensors = Vec::with_capacity(count);
+        
+        for _ in 0..count {
+            let tensor = self.allocate_kv_tensor_with_growth(
+                initial_seq_len,
+                expected_max_seq_len,
+                num_heads,
+                head_dim,
+                element_size,
+            )?;
+            tensors.push(tensor);
+        }
+        
+        Ok(tensors)
+    }
+
+    /// Get detailed arena health metrics
+    pub fn health_check(&self) -> ArenaHealthReport {
+        let utilization = self.utilization();
+        let available = self.available_space();
+        
+        let health_status = if utilization > 0.9 {
+            ArenaHealth::Critical
+        } else if utilization > 0.7 {
+            ArenaHealth::Warning
+        } else {
+            ArenaHealth::Healthy
+        };
+
+        ArenaHealthReport {
+            arena_id: self.arena_id,
+            health_status,
+            utilization_percent: (utilization * 100.0) as u32,
+            available_bytes: available,
+            fragmentation_estimate: 0.0, // Could be improved with tracking
+            recommended_action: match health_status {
+                ArenaHealth::Critical => "Consider creating new arena or cleaning up unused tensors".to_string(),
+                ArenaHealth::Warning => "Monitor usage and prepare for potential capacity issues".to_string(),
+                ArenaHealth::Healthy => "No action required".to_string(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum ArenaHealth {
+    Healthy,
+    Warning,
+    Critical,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArenaHealthReport {
+    pub arena_id: u64,
+    pub health_status: ArenaHealth,
+    pub utilization_percent: u32,
+    pub available_bytes: usize,
+    pub fragmentation_estimate: f64,
+    pub recommended_action: String,
+}
+
+// Enhanced GlobalSlabPool methods
+impl GlobalSlabPool {
+    /// Perform comprehensive cleanup and optimization
+    pub fn optimize(&self) -> PoolOptimizationReport {
+        let initial_stats = self.stats();
+        let pages_cleaned = self.cleanup_old_pages();
+        let final_stats = self.stats();
+        
+        PoolOptimizationReport {
+            pages_cleaned,
+            bytes_freed_mb: 0, // Would need tracking of cleaned page sizes
+            efficiency_before: initial_stats.recycling_efficiency,
+            efficiency_after: final_stats.recycling_efficiency,
+            pool_sizes_before: initial_stats.current_pool_sizes,
+            pool_sizes_after: final_stats.current_pool_sizes,
+        }
+    }
+
+    /// Get recommendations for pool tuning
+    pub fn get_tuning_recommendations(&self) -> Vec<PoolRecommendation> {
+        let stats = self.stats();
+        let mut recommendations = Vec::new();
+        
+        if stats.recycling_efficiency < 0.3 {
+            recommendations.push(PoolRecommendation {
+                severity: RecommendationSeverity::High,
+                message: "Low recycling efficiency detected. Consider reducing max_pages_per_class or reviewing allocation patterns.".to_string(),
+                action: "Tune pool parameters".to_string(),
+            });
+        }
+        
+        if stats.reuse_efficiency < 0.5 {
+            recommendations.push(PoolRecommendation {
+                severity: RecommendationSeverity::Medium,
+                message: "Pages are being recycled but not reused efficiently. Check device affinity and size matching.".to_string(),
+                action: "Review allocation patterns".to_string(),
+            });
+        }
+        
+        if recommendations.is_empty() {
+            recommendations.push(PoolRecommendation {
+                severity: RecommendationSeverity::Info,
+                message: "Pool is operating efficiently.".to_string(),
+                action: "No action required".to_string(),
+            });
+        }
+        
+        recommendations
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolOptimizationReport {
+    pub pages_cleaned: usize,
+    pub bytes_freed_mb: usize,
+    pub efficiency_before: f64,
+    pub efficiency_after: f64,
+    pub pool_sizes_before: [usize; 4],
+    pub pool_sizes_after: [usize; 4],
+}
+
+#[derive(Debug, Clone)]
+pub struct PoolRecommendation {
+    pub severity: RecommendationSeverity,
+    pub message: String,
+    pub action: String,
+}
+
+#[derive(Debug, Clone)]
+pub enum RecommendationSeverity {
+    Info,
+    Medium,
+    High,
+}
+
+// Test utilities (conditionally compiled)
+#[cfg(test)]
+impl ZeroCopyTensor {
+    /// Create a mock tensor for testing (without actual CUDA allocation)
+    pub fn mock_tensor(
+        seq_len: usize,
+        max_seq_len: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> Self {
+        let mock_ptr = NonNull::new(0x1000 as *mut u8).unwrap();
+        Self {
+            key_device_ptr: mock_ptr,
+            value_device_ptr: mock_ptr,
+            current_seq_len: AtomicUsize::new(seq_len),
+            max_seq_len,
+            num_heads,
+            head_dim,
+            element_size: 4, // f32
+            device_id: 0,
+            arena_id: 0,
+        }
+    }
 }
