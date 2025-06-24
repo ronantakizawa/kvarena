@@ -405,6 +405,46 @@ fn setup_library_exports() {
             "arena_get_default_page_size",
             "arena_get_alignment",
             "arena_align_size",
+            // Production API functions
+            "prod_extend_tensor_pure_zero_copy",
+            "prod_extend_tensor_zero_copy",
+            "prod_extend_tensor_for_generation",
+            "prod_get_zero_copy_stats",
+            "prod_get_tensor_device_ptrs",
+            "prod_copy_host_to_tensor",
+            "prod_copy_new_tokens_to_tensor",
+            "prod_copy_new_tokens_only",
+            "prod_get_tensor_memory_layout",
+            "prod_can_extend_zero_copy_to",
+            // Manager functions
+            "prod_kv_cache_init_for_server",
+            "prod_kv_cache_init_for_chatbot",
+            "prod_kv_cache_init_for_documents",
+            "prod_kv_cache_manager_free",
+            "prod_get_metrics",
+            "prod_get_system_health",
+            // Arena functions
+            "prod_create_sequence_arena_with_growth",
+            "prod_create_sequence_arena",
+            "prod_sequence_arena_free",
+            "prod_get_bump_arena_stats",
+            "prod_benchmark_pure_bump_allocation",
+            // Tensor functions
+            "prod_allocate_kv_tensor_with_growth",
+            "prod_allocate_kv_tensor_safe",
+            "prod_allocate_kv_tensor",
+            "prod_allocate_tensor_pure_bump",
+            "prod_kv_tensor_free",
+            // Slab functions
+            "prod_get_slab_recycling_stats",
+            "prod_cleanup_slab_pools",
+            "prod_verify_lock_free_recycling",
+            "prod_get_slab_pool_status",
+            // Utility functions
+            "prod_calculate_optimal_page_size",
+            "prod_get_version",
+            "prod_get_features",
+            "prod_check_cuda_availability",
         ];
         
         for export in &ffi_exports {

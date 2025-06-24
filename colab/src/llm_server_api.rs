@@ -1,4 +1,4 @@
-// src/llm_server_api.rs - LLM server API integration module
+// src/llm_server_api.rs - Fixed LLM server API integration module
 use crate::{
     zero_copy::{ZeroCopyArena, ZeroCopyTensor},
     LLMServerError, ProductionKVCacheManager, SequenceRequest,
@@ -62,8 +62,8 @@ pub fn simulate_generation(
     for i in 1..=num_tokens {
         let token_start = Instant::now();
 
-        // Try to extend the tensor by 1 token
-        match manager.extend_tensor_for_generation(arena, tensor, 1) {
+        // FIXED: Use the arena's extend method directly
+        match arena.extend_tensor_for_generation(tensor, 1) {
             Ok(was_zero_copy) => {
                 if was_zero_copy {
                     zero_copy_count += 1;
@@ -81,7 +81,7 @@ pub fn simulate_generation(
             }
             Err(e) => {
                 log::error!("Generation failed at token {}: {:?}", i, e);
-                return Err(e);
+                return Err(LLMServerError::from(e));
             }
         }
 
