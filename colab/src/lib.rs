@@ -3,11 +3,11 @@
 //! 
 //! A high-throughput, low-fragmentation memory manager for transformer key/value tensors.
 
-pub mod cuda;
+pub mod cuda; // Now points to the modular CUDA structure
 pub mod slab;
 pub mod zero_copy;
 pub mod kv_layout;
-pub mod ffi; // Now points to the modular FFI structure
+pub mod ffi;
 pub mod llm_server_api;
 
 use std::sync::Arc;
@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 // Re-export from the modular FFI
 pub use ffi::*;
 
-// Re-export main functionality
+// Re-export main functionality - updated imports
 use cuda::{CudaMemoryManager, CudaPage, CudaError, CudaContext};
 use zero_copy::{ZeroCopyArena, ZeroCopyTensor, ZeroCopyGlobalStats, ZeroCopyArenaStats, GlobalSlabPool, SlabPoolStats, ZeroCopyStats, ZeroCopyManager};
 use kv_layout::{ModelConfig, calculate_model_kv_page_size, calculate_optimal_kv_page_size};
