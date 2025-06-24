@@ -1,10 +1,145 @@
-// src/ffi/tensor.rs - Tensor allocation and manipulation FFI functions
+// src/ffi/tensor.rs - Tensor allocation and manipulation FFI functions with safety fixes
 use std::ffi::c_void;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Mutex, atomic::AtomicUsize, LazyLock};
 use super::types::*;
 
-/// Safe tensor creation to use safe parameters only
+/// Thread-safe tensor metadata storage
+static NEXT_TENSOR_ID: AtomicUsize = AtomicUsize::new(1);
+static TENSOR_STORAGE: LazyLock<Mutex<HashMap<usize, TensorMetadata>>> = 
+    LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// Tensor metadata for host-side tracking
+#[derive(Debug)]
+struct TensorMetadata {
+    seq_len: usize,
+    num_heads: usize,
+    head_dim: usize,
+    dtype_size: usize,
+    host_buffer: Vec<u8>,
+}
+
+/// Comprehensive tensor diagnostics structure
+#[repr(C)]
+#[derive(Debug)]
+pub struct CTensorDiagnostics {
+    pub seq_len: usize,
+    pub max_seq_len: usize,
+    pub num_heads: usize,
+    pub head_dim: usize,
+    pub current_bytes: usize,
+    pub max_bytes: usize,
+    pub utilization: f64,
+    pub memory_efficiency: f64,
+    pub can_grow: i32,
+    pub device_id: i32,
+    pub arena_id: u64,
+    pub key_ptr_aligned: i32,
+    pub value_ptr_aligned: i32,
+}
+
+/// Error codes for production FFI functions
+pub const PROD_SUCCESS: i32 = 0;
+pub const PROD_ERROR_INVALID_PARAM: i32 = -1;
+pub const PROD_ERROR_ALLOCATION_FAILED: i32 = -2;
+
+/// Safe tensor creation with CUDA alignment verification
+#[no_mangle]
+pub extern "C" fn prod_allocate_kv_tensor_safe(
+    manager: *mut CProductionManager,
+    arena: *mut CSequenceArena,
+    initial_seq_len: usize,
+    max_seq_len: usize,
+    hidden_dim: usize,
+    num_heads: usize,
+    dtype_size: usize,
+    tensor_out: *mut *mut CKVTensor,
+) -> i32 {
+    // Comprehensive parameter validation to prevent bad allocations
+    if manager.is_null() || arena.is_null() || tensor_out.is_null() {
+        log::error!("Null pointer passed to tensor allocation");
+        return PROD_ERROR_INVALID_PARAM;
+    }
+    
+    // Validate parameters that could cause alignment issues
+    if initial_seq_len == 0 || max_seq_len < initial_seq_len || num_heads == 0 || 
+       hidden_dim == 0 || dtype_size == 0 {
+        log::error!("Invalid tensor parameters: seq_len={}, max_seq_len={}, heads={}, hidden_dim={}, dtype_size={}", 
+                   initial_seq_len, max_seq_len, num_heads, hidden_dim, dtype_size);
+        return PROD_ERROR_INVALID_PARAM;
+    }
+    
+    // Check for dimension overflow that could cause alignment issues
+    if hidden_dim % num_heads != 0 {
+        log::error!("hidden_dim {} not divisible by num_heads {}", hidden_dim, num_heads);
+        return PROD_ERROR_INVALID_PARAM;
+    }
+    
+    let head_dim = hidden_dim / num_heads;
+    
+    // Check for size overflow before allocation
+    let max_elements = max_seq_len.saturating_mul(num_heads).saturating_mul(head_dim);
+    let max_size = max_elements.saturating_mul(dtype_size).saturating_mul(2); // K + V
+    
+    if max_size > 1024 * 1024 * 1024 { // > 1GB
+        log::error!("Tensor too large: {} GB", max_size / 1024 / 1024 / 1024);
+        return PROD_ERROR_INVALID_PARAM;
+    }
+    
+    // Ensure alignment-friendly sizes
+    if dtype_size > 8 || (dtype_size & (dtype_size - 1)) != 0 {
+        log::error!("dtype_size {} not power of 2 or too large", dtype_size);
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let arena_ref = unsafe { &(*arena).0 };
+
+    // Use a safer wrapper around the allocation
+    match std::panic::catch_unwind(|| {
+        arena_ref.allocate_kv_tensor_with_growth(
+            initial_seq_len,
+            max_seq_len,
+            num_heads,
+            head_dim,
+            dtype_size,
+        )
+    }) {
+        Ok(Ok(tensor)) => {
+            // Verify the tensor was created with proper alignment
+            let key_ptr = tensor.key_device_ptr();
+            let value_ptr = tensor.value_device_ptr();
+            
+            // Check alignment of the pointers
+            if (key_ptr as usize) % 256 != 0 || (value_ptr as usize) % 256 != 0 {
+                log::error!("Tensor pointers not properly aligned: key={:p}, value={:p}", 
+                           key_ptr, value_ptr);
+                return PROD_ERROR_ALLOCATION_FAILED;
+            }
+            
+            log::debug!("Created aligned tensor: key={:p}, value={:p}, seq_len={}", 
+                       key_ptr, value_ptr, tensor.seq_len());
+            
+            unsafe {
+                *tensor_out = Box::into_raw(Box::new(CKVTensor(tensor)));
+            }
+            PROD_SUCCESS
+        }
+        Ok(Err(e)) => {
+            log::error!("Tensor allocation failed: {:?}", e);
+            PROD_ERROR_ALLOCATION_FAILED
+        }
+        Err(_) => {
+            log::error!("Tensor allocation panicked");
+            PROD_ERROR_ALLOCATION_FAILED
+        }
+    }
+}
+
+/// Create arena with proper page alignment - removed duplicate, use the one in existing codebase
+
+/// Safe tensor creation with conservative parameters only
 #[no_mangle]
 pub extern "C" fn sequence_arena_allocate_tensor_safe(
     arena_ptr: *mut c_void,
@@ -47,8 +182,8 @@ pub extern "C" fn sequence_arena_allocate_tensor_safe(
         return -1;
     }
     
-    // Use the safe FFI wrapper
-    match super::safety::safe_ffi_wrapper(|| {
+    // Use safe allocation wrapper
+    match std::panic::catch_unwind(|| {
         arena_ref.allocate_kv_tensor_with_growth(seq_len, seq_len * 2, num_heads, head_dim, dtype_size)
     }) {
         Ok(Ok(_tensor)) => {
@@ -101,48 +236,6 @@ pub extern "C" fn prod_allocate_kv_tensor_with_growth(
     let head_dim = hidden_dim / num_heads;
 
     // Allocate tensor directly through arena
-    match arena_ref.allocate_kv_tensor_with_growth(
-        initial_seq_len,
-        max_seq_len,
-        num_heads,
-        head_dim,
-        dtype_size,
-    ) {
-        Ok(tensor) => {
-            unsafe {
-                *tensor_out = Box::into_raw(Box::new(CKVTensor(tensor)));
-            }
-            PROD_SUCCESS
-        }
-        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
-    }
-}
-
-/// Safe version of KV tensor allocation
-#[no_mangle]
-pub extern "C" fn prod_allocate_kv_tensor_safe(
-    manager: *mut CProductionManager,
-    arena: *mut CSequenceArena,
-    initial_seq_len: usize,
-    max_seq_len: usize,
-    hidden_dim: usize,
-    num_heads: usize,
-    dtype_size: usize,
-    tensor_out: *mut *mut CKVTensor,
-) -> i32 {
-    // Comprehensive parameter validation
-    if manager.is_null() || arena.is_null() || tensor_out.is_null() {
-        return PROD_ERROR_INVALID_PARAM;
-    }
-    
-    if initial_seq_len == 0 || max_seq_len < initial_seq_len || num_heads == 0 || 
-       hidden_dim == 0 || dtype_size == 0 {
-        return PROD_ERROR_INVALID_PARAM;
-    }
-
-    let arena_ref = unsafe { &(*arena).0 };
-    let head_dim = hidden_dim / num_heads;
-
     match arena_ref.allocate_kv_tensor_with_growth(
         initial_seq_len,
         max_seq_len,
@@ -510,6 +603,286 @@ pub extern "C" fn prod_get_zero_copy_stats(
         (*stats_out).utilization = stats.utilization;
         (*stats_out).memory_efficiency = stats.memory_efficiency;
         (*stats_out).can_grow_without_copy = if stats.can_grow_without_copy { 1 } else { 0 };
+    }
+
+    PROD_SUCCESS
+}
+
+/// Copy tensor data to device with alignment verification
+#[no_mangle]
+pub extern "C" fn prod_copy_tensor_to_device(
+    tensor: *mut CKVTensor,
+    host_key_data: *const c_void,
+    host_value_data: *const c_void,
+    start_token: usize,
+    num_tokens: usize,
+) -> i32 {
+    if tensor.is_null() || host_key_data.is_null() || host_value_data.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+
+    // Verify pointers are properly aligned
+    if (host_key_data as usize) % 8 != 0 || (host_value_data as usize) % 8 != 0 {
+        log::error!("Host data pointers not properly aligned");
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    match tensor_ref.copy_new_tokens_from_host(
+        host_key_data as *const u8,
+        host_value_data as *const u8,
+        start_token,
+        num_tokens,
+    ) {
+        Ok(()) => PROD_SUCCESS,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Get tensor device pointers with alignment verification
+#[no_mangle]
+pub extern "C" fn prod_get_tensor_device_ptrs(
+    tensor: *mut CKVTensor,
+    key_ptr_out: *mut *mut c_void,
+    value_ptr_out: *mut *mut c_void,
+) -> i32 {
+    if tensor.is_null() || key_ptr_out.is_null() || value_ptr_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    
+    let key_ptr = tensor_ref.key_device_ptr();
+    let value_ptr = tensor_ref.value_device_ptr();
+
+    // Verify alignment before returning pointers
+    if (key_ptr as usize) % 256 != 0 || (value_ptr as usize) % 256 != 0 {
+        log::error!("Device pointers not properly aligned: key={:p}, value={:p}", key_ptr, value_ptr);
+        return PROD_ERROR_ALLOCATION_FAILED;
+    }
+
+    unsafe {
+        *key_ptr_out = key_ptr;
+        *value_ptr_out = value_ptr;
+    }
+
+    PROD_SUCCESS
+}
+
+/// Get tensor dimensions safely
+#[no_mangle]
+pub extern "C" fn prod_get_tensor_dimensions(
+    tensor: *mut CKVTensor,
+    seq_len_out: *mut usize,
+    num_heads_out: *mut usize,
+    head_dim_out: *mut usize,
+) -> i32 {
+    if tensor.is_null() || seq_len_out.is_null() || 
+       num_heads_out.is_null() || head_dim_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    let (seq_len, num_heads, head_dim) = tensor_ref.dimensions();
+
+    unsafe {
+        *seq_len_out = seq_len;
+        *num_heads_out = num_heads;
+        *head_dim_out = head_dim;
+    }
+
+    PROD_SUCCESS
+}
+
+/// Synchronize tensor operations
+#[no_mangle]
+pub extern "C" fn prod_tensor_synchronize(tensor: *mut CKVTensor) -> i32 {
+    if tensor.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    
+    match tensor_ref.synchronize() {
+        Ok(()) => PROD_SUCCESS,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Check if tensor can extend to given length without copy
+#[no_mangle]
+pub extern "C" fn prod_tensor_can_extend_zero_copy(
+    tensor: *mut CKVTensor,
+    target_seq_len: usize,
+) -> i32 {
+    if tensor.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    
+    if tensor_ref.can_extend_zero_copy_to(target_seq_len) {
+        1 // Can extend
+    } else {
+        0 // Cannot extend
+    }
+}
+
+/// Get tensor memory usage
+#[no_mangle]
+pub extern "C" fn prod_get_tensor_memory_usage(
+    tensor: *mut CKVTensor,
+    current_bytes_out: *mut usize,
+    max_bytes_out: *mut usize,
+    utilization_out: *mut f64,
+) -> i32 {
+    if tensor.is_null() || current_bytes_out.is_null() || 
+       max_bytes_out.is_null() || utilization_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+
+    unsafe {
+        *current_bytes_out = tensor_ref.size_bytes();
+        *max_bytes_out = tensor_ref.max_allocated_size_bytes();
+        *utilization_out = tensor_ref.utilization();
+    }
+
+    PROD_SUCCESS
+}
+
+/// Validate tensor integrity
+#[no_mangle]
+pub extern "C" fn prod_validate_tensor_integrity(tensor: *mut CKVTensor) -> i32 {
+    if tensor.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    
+    // Check basic tensor state
+    if tensor_ref.seq_len() == 0 || tensor_ref.max_seq_len() == 0 {
+        return 0; // Invalid
+    }
+    
+    if tensor_ref.seq_len() > tensor_ref.max_seq_len() {
+        return 0; // Invalid
+    }
+    
+    // Check pointer alignment
+    let key_ptr = tensor_ref.key_device_ptr();
+    let value_ptr = tensor_ref.value_device_ptr();
+    
+    if (key_ptr as usize) % 256 != 0 || (value_ptr as usize) % 256 != 0 {
+        return 0; // Invalid alignment
+    }
+    
+    1 // Valid
+}
+
+/// Reset tensor to initial state (for reuse)
+#[no_mangle]
+pub extern "C" fn prod_reset_tensor(
+    tensor: *mut CKVTensor,
+    new_seq_len: usize,
+) -> i32 {
+    if tensor.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    
+    // Check if new length is within bounds
+    if new_seq_len > tensor_ref.max_seq_len() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+    
+    // Reset to new length (this is essentially a zero-copy "shrink")
+    match tensor_ref.extend_zero_copy(new_seq_len) {
+        Ok(_) => PROD_SUCCESS,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Get tensor device ID
+#[no_mangle]
+pub extern "C" fn prod_get_tensor_device_id(tensor: *mut CKVTensor) -> i32 {
+    if tensor.is_null() {
+        return -1;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    tensor_ref.device_id()
+}
+
+/// Copy partial tensor data (for incremental updates)
+#[no_mangle]
+pub extern "C" fn prod_copy_partial_tensor_data(
+    tensor: *mut CKVTensor,
+    host_key_data: *const c_void,
+    host_value_data: *const c_void,
+    start_token: usize,
+    num_tokens: usize,
+    verify_bounds: i32,
+) -> i32 {
+    if tensor.is_null() || host_key_data.is_null() || host_value_data.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+
+    // Optional bounds verification
+    if verify_bounds != 0 {
+        if start_token + num_tokens > tensor_ref.seq_len() {
+            log::error!("Copy bounds exceed tensor length: {} + {} > {}", 
+                       start_token, num_tokens, tensor_ref.seq_len());
+            return PROD_ERROR_INVALID_PARAM;
+        }
+    }
+
+    match tensor_ref.copy_new_tokens_only(
+        host_key_data as *const u8,
+        host_value_data as *const u8,
+        start_token,
+        num_tokens,
+    ) {
+        Ok(()) => PROD_SUCCESS,
+        Err(_) => PROD_ERROR_ALLOCATION_FAILED,
+    }
+}
+
+/// Batch tensor operations for efficiency - removed duplicate, use the one in utils.rs
+
+/// Get comprehensive tensor diagnostics
+#[no_mangle]
+pub extern "C" fn prod_get_tensor_diagnostics(
+    tensor: *mut CKVTensor,
+    diagnostics_out: *mut CTensorDiagnostics,
+) -> i32 {
+    if tensor.is_null() || diagnostics_out.is_null() {
+        return PROD_ERROR_INVALID_PARAM;
+    }
+
+    let tensor_ref = unsafe { &(*tensor).0 };
+    let stats = tensor_ref.zero_copy_stats();
+    let (seq_len, num_heads, head_dim) = tensor_ref.dimensions();
+
+    unsafe {
+        (*diagnostics_out).seq_len = seq_len;
+        (*diagnostics_out).max_seq_len = stats.max_seq_len;
+        (*diagnostics_out).num_heads = num_heads;
+        (*diagnostics_out).head_dim = head_dim;
+        (*diagnostics_out).current_bytes = tensor_ref.size_bytes();
+        (*diagnostics_out).max_bytes = tensor_ref.max_allocated_size_bytes();
+        (*diagnostics_out).utilization = stats.utilization;
+        (*diagnostics_out).memory_efficiency = stats.memory_efficiency;
+        (*diagnostics_out).can_grow = if stats.can_grow_without_copy { 1 } else { 0 };
+        (*diagnostics_out).device_id = tensor_ref.device_id();
+        (*diagnostics_out).arena_id = tensor_ref.arena_id();
+        (*diagnostics_out).key_ptr_aligned = if (tensor_ref.key_device_ptr() as usize) % 256 == 0 { 1 } else { 0 };
+        (*diagnostics_out).value_ptr_aligned = if (tensor_ref.value_device_ptr() as usize) % 256 == 0 { 1 } else { 0 };
     }
 
     PROD_SUCCESS

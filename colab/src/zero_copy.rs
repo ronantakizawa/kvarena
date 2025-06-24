@@ -510,33 +510,71 @@ impl ZeroCopyArena {
         }
     }
 
-    /// Pure bump allocation with direct page access
+    /// Pure bump allocation with CUDA alignment and overflow protection
     pub fn bump_allocate(&self, size: usize, align: usize) -> Option<NonNull<u8>> {
-        let aligned_size = (size + align - 1) & !(align - 1);
+        // CRITICAL: Force CUDA alignment for all allocations
+        const CUDA_ALIGNMENT: usize = 256;
+        let required_align = align.max(CUDA_ALIGNMENT);
+        
+        // Safe size calculation with overflow protection
+        let aligned_size = if size == 0 {
+            required_align
+        } else {
+            // Check for overflow
+            if size > usize::MAX - required_align {
+                log::error!("Size too large for alignment: {}", size);
+                return None;
+            }
+            
+            // Calculate aligned size
+            let aligned = (size + required_align - 1) & !(required_align - 1);
+            aligned.max(32) // Minimum 32 bytes
+        };
         
         // Atomic bump allocation
         let old_offset = self.current_offset.fetch_add(aligned_size, Ordering::Relaxed);
         
-        if old_offset + aligned_size <= self.page.size() {
-            // Calculate device pointer directly from page
-            unsafe {
-                let base_ptr = self.page.device_ptr() as *mut u8;
-                let alloc_ptr = base_ptr.add(old_offset);
-                Some(NonNull::new_unchecked(alloc_ptr))
-            }
-        } else {
+        // Check bounds with overflow protection
+        if old_offset > self.page.size() || aligned_size > self.page.size() - old_offset {
             // Revert offset and fail
-            let _ = self.current_offset.compare_exchange(
-                old_offset + aligned_size, 
-                old_offset, 
-                Ordering::Relaxed, 
-                Ordering::Relaxed
-            );
-            None
+            self.current_offset.fetch_sub(aligned_size, Ordering::Relaxed);
+            log::debug!("Arena allocation failed: {} bytes requested, {} available", 
+                       aligned_size, self.page.size().saturating_sub(old_offset));
+            return None;
+        }
+        
+        // Calculate device pointer directly from page
+        unsafe {
+            let base_ptr = self.page.device_ptr() as *mut u8;
+            let alloc_ptr = base_ptr.add(old_offset);
+            
+            // CRITICAL: Verify alignment before returning
+            let base_addr = base_ptr as usize;
+            let ptr_addr = alloc_ptr as usize;
+            
+            // Check base alignment
+            if base_addr % CUDA_ALIGNMENT != 0 {
+                log::error!("Page base pointer not aligned: {:p}", base_ptr);
+                self.current_offset.fetch_sub(aligned_size, Ordering::Relaxed);
+                return None;
+            }
+            
+            // Check final alignment
+            if ptr_addr % required_align != 0 {
+                log::error!("Arena pointer not aligned: {:p} (expected {} bytes)", 
+                           alloc_ptr, required_align);
+                self.current_offset.fetch_sub(aligned_size, Ordering::Relaxed);
+                return None;
+            }
+            
+            log::trace!("✓ Arena allocated {} bytes at offset {} (aligned ptr {:p})", 
+                       aligned_size, old_offset, alloc_ptr);
+            
+            Some(NonNull::new_unchecked(alloc_ptr))
         }
     }
 
-    /// Allocate KV tensor with direct page access
+    /// Allocate KV tensor with CUDA alignment verification
     pub fn allocate_kv_tensor_with_growth(
         &self,
         initial_seq_len: usize,
@@ -549,11 +587,34 @@ impl ZeroCopyArena {
         let max_v_size = expected_max_seq_len * num_heads * head_dim * element_size;
         let total_max_size = max_k_size + max_v_size;
         
-        // Pure bump allocation
-        let device_ptr = self.bump_allocate(total_max_size, 256)
-            .ok_or(CudaError(-2))?;
+        // CRITICAL: Use 256-byte alignment for CUDA compatibility
+        const CUDA_ALIGNMENT: usize = 256;
         
-        // Create tensor with NO page reference
+        // Verify tensor size is reasonable
+        if total_max_size > 1024 * 1024 * 1024 { // > 1GB
+            log::error!("Tensor too large: {} GB", total_max_size / 1024 / 1024 / 1024);
+            return Err(CudaError(-4));
+        }
+        
+        // Pure bump allocation with CUDA alignment
+        let device_ptr = self.bump_allocate(total_max_size, CUDA_ALIGNMENT)
+            .ok_or_else(|| {
+                log::error!("Failed to allocate {} bytes for KV tensor", total_max_size);
+                CudaError(-2)
+            })?;
+        
+        // Verify pointer alignment before creating tensor
+        let ptr_addr = device_ptr.as_ptr() as usize;
+        if ptr_addr % CUDA_ALIGNMENT != 0 {
+            log::error!("KV tensor pointer not properly aligned: {:p} (expected {} byte alignment)", 
+                       device_ptr.as_ptr(), CUDA_ALIGNMENT);
+            return Err(CudaError(-3));
+        }
+        
+        log::debug!("✓ KV tensor allocated with proper alignment: {:p} ({}KB total)", 
+                   device_ptr.as_ptr(), total_max_size / 1024);
+        
+        // Create tensor with NO page reference (enables slab recycling)
         ZeroCopyTensor::from_bump_allocation(
             device_ptr,
             initial_seq_len,
@@ -562,7 +623,7 @@ impl ZeroCopyArena {
             head_dim,
             element_size,
             self.arena_id,
-            self.page.device_id(), // Pass device_id, not page reference
+            self.page.device_id(), // Pass device_id directly, not page reference
         )
     }
 
@@ -657,7 +718,8 @@ pub struct ZeroCopyManager {
 
 impl ZeroCopyManager {
     pub fn new(slab_pool: Arc<GlobalSlabPool>) -> Result<Self, CudaError> {
-        let cuda_context = Arc::new(CudaContext::new()?);
+        // Use safe CUDA initialization
+        let cuda_context = Arc::new(crate::cuda::create_safe_cuda_context()?);
         
         Ok(Self {
             slab_pool,
