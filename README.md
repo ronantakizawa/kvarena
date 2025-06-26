@@ -1,5 +1,5 @@
-# Arena KV-Cache  
-**High-Performance Memory Manager for Transformer Key/Value Tensors**
+# Arena KV-Cache  for Mistral-7B-Instruct-v0.1
+**High-Performance Memory Manager for Transformer Key/Value Tensors for Mistral-7B-Instruct-v0.1**
 
 Arena-Allocated KV-Cache with **Slab Recycling** & **True Zero-Copy Extensions** – a production-ready, low-fragmentation memory manager for LLM servers, written in Rust with seamless Python bindings.
 
