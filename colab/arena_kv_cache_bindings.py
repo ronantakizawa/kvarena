@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
-FIXED Arena KV-Cache Implementation with proper KV head handling
-This addresses the key issue: Mistral 7B uses 8 KV heads, not 32 heads
+FIXED Arena KV-Cache Implementation with proper tensor shape handling
+This addresses the tensor shape mismatch issue in cache updates
 """
 
 import ctypes
@@ -417,7 +417,7 @@ class SequenceArena:
     def extend_pytorch_tensors(self, key_tensor: torch.Tensor, value_tensor: torch.Tensor,
                               offset: int, size: int, new_seq_len: int) -> Tuple[torch.Tensor, torch.Tensor, bool]:
         """
-        FIXED: Extend KV tensors maintaining proper KV head dimensions.
+        FIXED: Extend KV tensors maintaining proper KV head dimensions with correct shape handling.
         
         Args:
             key_tensor: Current key tensor
@@ -438,11 +438,15 @@ class SequenceArena:
         else:
             raise ValueError(f"Unexpected key tensor shape: {key_tensor.shape}")
         
+        # FIXED: Don't extend if new_seq_len is smaller or equal
+        if new_seq_len <= old_seq_len:
+            logger.debug(f"No extension needed: {new_seq_len} <= {old_seq_len}")
+            return key_tensor, value_tensor, True  # No operation needed
+        
         dtype = key_tensor.dtype
         device = key_tensor.device
         
-        # For now, implement simple extension (copy-based)
-        # In a full implementation, this would use arena extension capabilities
+        # Create new tensors with extended sequence length
         if key_tensor.dim() == 4:
             new_shape = (batch_size, num_kv_heads, new_seq_len, head_dim)
         else:
@@ -451,7 +455,7 @@ class SequenceArena:
         new_key = torch.zeros(new_shape, dtype=dtype, device=device)
         new_value = torch.zeros(new_shape, dtype=dtype, device=device)
         
-        # Copy existing data
+        # Copy existing data to new tensors
         try:
             if key_tensor.dim() == 4:
                 new_key[:, :, :old_seq_len, :] = key_tensor
@@ -545,7 +549,7 @@ def create_model_optimized_manager(model_name: str, max_seq_len: Optional[int] =
 
 # FIXED: ArenaKVCache class for integration with transformers
 class ArenaKVCache:
-    """FIXED: Arena-based KV cache that properly handles different head configurations."""
+    """FIXED: Arena-based KV cache that properly handles different head configurations and tensor shapes."""
     
     def __init__(self, model, arena_manager: ArenaKVCacheManager, max_seq_len: int = 4096):
         self.model = model
@@ -638,7 +642,7 @@ class ArenaKVCache:
             print(f"⚠️  Only {successful_layers} layers cached due to memory constraints")
     
     def extend_cache(self, new_seq_len: int) -> Tuple[int, int]:
-        """Extend the KV cache to accommodate new sequence length."""
+        """FIXED: Extend the KV cache to accommodate new sequence length with proper shape handling."""
         if new_seq_len <= self.current_length:
             return 0, 0  # No extension needed
         
@@ -647,12 +651,10 @@ class ArenaKVCache:
         
         for layer_idx in self.layer_tensors:
             tensor_info = self.layer_tensors[layer_idx]
-            current_max = tensor_info.get('max_seq_len', tensor_info['key'].shape[-2])  # seq_len is dim -2
+            current_seq_len = tensor_info.get('current_seq_len', tensor_info['key'].shape[-2])
             
-            if new_seq_len <= current_max:
-                zero_copy_count += 1
-            else:
-                # Need to reallocate tensors
+            # FIXED: Only extend if new_seq_len is actually larger
+            if new_seq_len > current_seq_len:
                 try:
                     arena = self.layer_arenas[layer_idx]
                     new_key, new_value, was_zero_copy = arena.extend_pytorch_tensors(
@@ -663,7 +665,7 @@ class ArenaKVCache:
                     # Update tensor info
                     tensor_info['key'] = new_key
                     tensor_info['value'] = new_value
-                    tensor_info['max_seq_len'] = new_seq_len
+                    tensor_info['current_seq_len'] = new_seq_len
                     
                     if was_zero_copy:
                         zero_copy_count += 1
@@ -673,6 +675,9 @@ class ArenaKVCache:
                 except Exception as e:
                     print(f"⚠️ Failed to extend layer {layer_idx}: {e}")
                     copy_count += 1
+            else:
+                # No extension needed for this layer
+                zero_copy_count += 1
         
         self.current_length = new_seq_len
         return zero_copy_count, copy_count
@@ -686,7 +691,7 @@ class ArenaKVCache:
         return tensor_info['key'], tensor_info['value']
     
     def update_cache(self, layer_idx: int, key_states: torch.Tensor, value_states: torch.Tensor):
-        """Update the cache with new key/value states."""
+        """FIXED: Update the cache with new key/value states with proper shape handling."""
         if layer_idx not in self.layer_tensors:
             print(f"⚠️ Layer {layer_idx} not in cache, skipping update")
             return
@@ -723,49 +728,93 @@ class ArenaKVCache:
             
             print(f"🔄 Mapped {self.num_query_heads} query heads to {num_heads} KV heads for layer {layer_idx}")
         
-        # Ensure cache can accommodate new states
+        # FIXED: Ensure cache can accommodate new states with proper dimension handling
         cache_tensor = tensor_info['key']
         if cache_tensor.dim() == 4:
-            current_max = cache_tensor.shape[2]  # seq_len dimension
+            cache_seq_len = cache_tensor.shape[2]  # seq_len dimension
         else:
-            current_max = cache_tensor.shape[1]  # seq_len dimension
+            cache_seq_len = cache_tensor.shape[1]  # seq_len dimension
         
-        if seq_len > current_max:
-            print(f"🔄 Extending cache for layer {layer_idx}: {current_max} -> {seq_len}")
+        # FIXED: Only extend if the incoming sequence is actually longer
+        if seq_len > cache_seq_len:
+            print(f"🔄 Extending cache for layer {layer_idx}: {cache_seq_len} -> {seq_len}")
             self.extend_cache(seq_len)
             tensor_info = self.layer_tensors[layer_idx]  # Get updated tensor info
         
-        # Copy new states to arena tensors
+        # FIXED: Copy new states to arena tensors with proper shape matching
         try:
             cache_key = tensor_info['key']
             cache_value = tensor_info['value']
             
-            # Ensure compatible shapes
+            # FIXED: Handle shape compatibility more carefully
             if cache_key.shape != key_states.shape:
-                # Try to make shapes compatible
+                # Get current cache dimensions
+                if cache_key.dim() == 4:
+                    cache_batch, cache_heads, cache_seq, cache_head_dim = cache_key.shape
+                else:
+                    cache_heads, cache_seq, cache_head_dim = cache_key.shape
+                    cache_batch = 1
+                
+                # Handle batch dimension mismatch
                 if cache_key.dim() == 4 and key_states.dim() == 3:
                     key_states = key_states.unsqueeze(0)
                     value_states = value_states.unsqueeze(0)
                 elif cache_key.dim() == 3 and key_states.dim() == 4:
                     key_states = key_states.squeeze(0)
                     value_states = value_states.squeeze(0)
+                
+                # FIXED: Handle sequence length mismatch by creating new cache tensors if needed
+                new_seq_len = max(cache_seq, seq_len)
+                if new_seq_len > cache_seq:
+                    # Need to create new cache tensors with larger sequence length
+                    device = cache_key.device
+                    dtype = cache_key.dtype
+                    
+                    if cache_key.dim() == 4:
+                        new_cache_shape = (cache_batch, cache_heads, new_seq_len, cache_head_dim)
+                    else:
+                        new_cache_shape = (cache_heads, new_seq_len, cache_head_dim)
+                    
+                    new_cache_key = torch.zeros(new_cache_shape, dtype=dtype, device=device)
+                    new_cache_value = torch.zeros(new_cache_shape, dtype=dtype, device=device)
+                    
+                    # Copy existing cache data
+                    if cache_key.dim() == 4:
+                        new_cache_key[:, :, :cache_seq, :] = cache_key
+                        new_cache_value[:, :, :cache_seq, :] = cache_value
+                    else:
+                        new_cache_key[:, :cache_seq, :] = cache_key
+                        new_cache_value[:, :cache_seq, :] = cache_value
+                    
+                    # Update tensor info
+                    tensor_info['key'] = new_cache_key
+                    tensor_info['value'] = new_cache_value
+                    tensor_info['current_seq_len'] = new_seq_len
+                    
+                    cache_key = new_cache_key
+                    cache_value = new_cache_value
             
-            # Copy data with proper indexing
+            # FIXED: Copy the new states with proper indexing
+            # Only copy up to the actual sequence length of the incoming data
+            actual_copy_len = min(seq_len, cache_key.shape[-2])  # Use the seq_len dimension
+            
             if cache_key.dim() == 4:
-                cache_key[:, :, :seq_len, :] = key_states
-                cache_value[:, :, :seq_len, :] = value_states
+                cache_key[:, :, :actual_copy_len, :] = key_states[:, :, :actual_copy_len, :]
+                cache_value[:, :, :actual_copy_len, :] = value_states[:, :, :actual_copy_len, :]
             else:
-                cache_key[:, :seq_len, :] = key_states
-                cache_value[:, :seq_len, :] = value_states
+                cache_key[:, :actual_copy_len, :] = key_states[:, :actual_copy_len, :]
+                cache_value[:, :actual_copy_len, :] = value_states[:, :actual_copy_len, :]
             
             # Update current length tracking
-            tensor_info['current_seq_len'] = seq_len
-            self.current_length = max(self.current_length, seq_len)
+            tensor_info['current_seq_len'] = actual_copy_len
+            self.current_length = max(self.current_length, actual_copy_len)
             
         except Exception as e:
             print(f"⚠️ Cache update failed for layer {layer_idx}: {e}")
             print(f"   Key states shape: {key_states.shape}")
             print(f"   Cache tensor shape: {tensor_info['key'].shape}")
+            import traceback
+            traceback.print_exc()
     
     def clear_cache(self):
         """Reset the cache to initial state."""
@@ -980,6 +1029,8 @@ def main():
         print("✅ Correct KV tensor sizing and allocation")
         print("✅ Model-specific configurations")
         print("✅ Arena allocation uses actual KV head counts")
+        print("✅ Fixed tensor shape handling in cache updates")
+        print("✅ Proper sequence length extension logic")
     else:
         print("\n❌ Some tests failed. Please check the implementation.")
     
